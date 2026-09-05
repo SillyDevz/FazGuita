@@ -1,0 +1,14 @@
+# Local monitoring history and temporary files
+pokemon-state.json*
+pokemon-mock-state.json*
+mock-test-*
+test-state-*
+test-config-*
+config-test-*
+
+# Dependencies, caches, and credentials
+node_modules/
+.wrangler/
+.dev.vars*
+.env*
+*.log

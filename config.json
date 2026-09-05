@@ -1,0 +1,12 @@
+{
+  "soundFile": "level-up-ringtone.mp3",
+  "volume": 100,
+  "soundRepeats": 5,
+  "intervalSeconds": 15,
+  "alertOnNewProducts": true,
+  "alertOnRestocks": true,
+  "alertOnSoldOutListings": true,
+  "includeKeywords": [],
+  "excludeKeywords": [],
+  "openBrowserOnAlert": false
+}

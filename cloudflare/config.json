@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "alertOnNewProducts": true,
+  "alertOnRestocks": true,
+  "alertOnSoldOutListings": true,
+  "includeKeywords": [],
+  "excludeKeywords": []
+}

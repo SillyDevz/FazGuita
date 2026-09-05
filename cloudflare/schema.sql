@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS monitor (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  state TEXT NOT NULL DEFAULT '{}',
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  lease_token TEXT
+);
+INSERT OR IGNORE INTO monitor (id) VALUES (1);

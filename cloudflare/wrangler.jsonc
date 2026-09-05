@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "geekhaven-monitor",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-05",
+  "workers_dev": true,
+  "triggers": { "crons": ["* * * * *"] },
+  "observability": { "enabled": true },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "geekhaven-monitor",
+    "database_id": "REPLACE_WITH_YOUR_DATABASE_ID"
+  }]
+}
