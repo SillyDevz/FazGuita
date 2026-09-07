@@ -8,7 +8,7 @@ PowerShell examples below. On macOS/Linux/bash, replace `npm.cmd` / `npx.cmd` wi
 
 Before pulling code, write down (offline notes, not the git repo):
 
-- Worker **name** (default upstream: `geekhaven-monitor`)
+- Worker **name** (default upstream: `site-monitor`)
 - D1 **database name**, **database_id** UUID, and binding name (**`DB`**)
 - Worker URL (`https://….workers.dev`)
 - Which secrets already exist (`DISCORD_WEBHOOK_URL`, `ADMIN_TOKEN`, and later Discord keys)
@@ -19,7 +19,7 @@ Do **not** create a new Worker or a new D1 database. Do **not** reset monitor st
 
 ## 2. Preserve local deployment config
 
-Keep your real `database_id` (and any account-specific wrangler values) in the local `wrangler.jsonc` you deploy with. Do not commit real account IDs, tokens, or production UUIDs to a shared remote if your workflow treats them as private. Upstream ships `REPLACE_WITH_YOUR_DATABASE_ID` as a placeholder only.
+Keep your real `database_id` (and any account-specific wrangler values) in the local `wrangler.jsonc` you deploy with. Do not commit real account IDs or tokens to a shared remote if your workflow treats them as private. The repo’s committed `wrangler.jsonc` already contains **deployment-specific** Worker/`database_id` values for an existing install — they are not a blank placeholder. On upgrade, **preserve your existing** `DB` binding and `database_id` UUID; do not replace them with another account’s committed ID and do not create a new D1 database.
 
 Recommended: copy today’s working `wrangler.jsonc` aside, then after `git pull` restore **name**, **database_id**, **DB** binding, and `triggers.crons` (keep `* * * * *` unless you intentionally paused cron).
 
@@ -44,9 +44,9 @@ Tests need **Node.js 22+** (`node:sqlite`). Run `wrangler login` even if you alr
 
 ## 4. Point wrangler at the existing Worker + D1
 
-Replace the placeholder `wrangler.jsonc` fields with your inventory from step 1:
+Align committed/`wrangler.jsonc` fields with your inventory from step 1 (preserve your existing D1 UUID and `DB` binding):
 
-- `"name": "geekhaven-monitor"` (or your existing Worker name — must match the Worker you will deploy onto)
+- `"name": "site-monitor"` (or your existing Worker name — must match the Worker you will deploy onto)
 - `d1_databases[0].binding`: `"DB"`
 - `d1_databases[0].database_name`: your existing D1 name
 - `d1_databases[0].database_id`: your existing UUID
@@ -144,7 +144,7 @@ Do not paste the bot token into command history or source files. Never upload `D
 Prompt for the **existing** `ADMIN_TOKEN` (do not rotate). Build headers, then call health/status:
 
 ```powershell
-$workerUrl = 'https://geekhaven-monitor.YOUR-SUBDOMAIN.workers.dev'
+$workerUrl = 'https://site-monitor.YOUR-SUBDOMAIN.workers.dev'
 $secureAdmin = Read-Host -AsSecureString 'Existing ADMIN_TOKEN'
 try {
   $adminToken = [System.Net.NetworkCredential]::new('', $secureAdmin).Password
@@ -183,7 +183,7 @@ Notifications never guarantee stock still exists when you click.
 Optional. Use this when you want pushes to update the **same** already-deployed Worker. Official docs: [Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/), [build configuration](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/).
 
 1. **Schema first (manual).** Apply `schema.sql` to the existing D1 database (step 5) **before** the first automated production deploy. Auto-deploy does not run schema for you.
-2. **Committed `wrangler.jsonc` must match production.** GitHub Builds uses the **committed** file in the repo root directory — not a local-only edit and not dashboard-only bindings. Before enabling Builds, ensure the committed config’s Worker `name` matches the existing Worker and that `database_id` is your real existing D1 UUID (not `REPLACE_WITH_YOUR_DATABASE_ID`). The D1 UUID is an identifier, not an auth secret; commit it only if your privacy policy allows. Do not invent unimplemented “generate config from build vars” support here. Secrets never go in git.
+2. **Committed `wrangler.jsonc` must match production.** GitHub Builds uses the **committed** file in the repo root directory — not a local-only edit and not dashboard-only bindings. Before enabling Builds, ensure the committed config’s Worker `name` matches the existing Worker and that `database_id` is **your** real existing D1 UUID (preserve the binding you already run; do not swap in another account’s committed ID). The D1 UUID is an identifier, not an auth secret; commit it only if your privacy policy allows. Do not invent unimplemented “generate config from build vars” support here. Secrets never go in git.
 3. **`enabled` is intentional.** Upstream `cloudflare/config.json` ships `"enabled": false`. A CI deploy of that file pauses monitoring until you commit `true` (or keep deploying paused on purpose).
 4. **Connect Builds to the existing Worker** ([connect an existing Worker](https://developers.cloudflare.com/workers/ci-cd/builds/#connect-an-existing-worker)): Cloudflare dashboard → **Workers & Pages** → **your existing Worker** (not Create Pages / not a new Worker) → **Settings** → **Builds** → **Connect**. Authorize GitHub for **only** the `SillyDevz/FazGuita` repository.
 5. **Build settings** ([configuration](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)):

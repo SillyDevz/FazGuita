@@ -31,7 +31,7 @@ Approve the Cloudflare login in the browser. Use `.cmd` as shown to avoid PowerS
 npx.cmd wrangler d1 create geekhaven-monitor
 ```
 
-Copy the `database_id` UUID printed by the command. Open `wrangler.jsonc` and replace only `REPLACE_WITH_YOUR_DATABASE_ID` with that UUID. Keep the binding name `DB` and the default Worker/database name `geekhaven-monitor` unless you deliberately chose different names. If Wrangler offers to edit the configuration itself, check that it filled the existing DB binding rather than adding a duplicate. Do not commit real account IDs or tokens; keep local deployment values out of shared commits when they identify your account.
+Copy the `database_id` UUID printed by the command. Open `wrangler.jsonc` and set `d1_databases[0].database_id` to **that newly created UUID**. Do **not** reuse the `database_id` already committed in the repo (it belongs to another Cloudflare account’s D1). Keep the binding name `DB`, the default Worker name `site-monitor`, and the default D1 database name `geekhaven-monitor` unless you deliberately chose different names. If Wrangler offers to edit the configuration itself, check that it filled the existing DB binding rather than adding a duplicate. Do not commit real account IDs or tokens; keep local deployment values out of shared commits when they identify your account.
 
 Create the tables in the cloud database:
 
@@ -61,10 +61,10 @@ $adminToken | npx.cmd wrangler secret put ADMIN_TOKEN
 
 Keep this terminal open for the following steps. The token stays in `$adminToken` for this terminal session; you can generate and upload a replacement with the same commands later. Prefer keeping existing webhook and admin secrets when upgrading; there is no need to rotate them for a normal setup.
 
-Wrangler prints the deployed Worker URL, similar to `https://geekhaven-monitor.YOUR-SUBDOMAIN.workers.dev`. Copy your actual URL:
+Wrangler prints the deployed Worker URL, similar to `https://site-monitor.YOUR-SUBDOMAIN.workers.dev`. Copy your actual URL:
 
 ```powershell
-$workerUrl = 'https://geekhaven-monitor.YOUR-SUBDOMAIN.workers.dev'
+$workerUrl = 'https://site-monitor.YOUR-SUBDOMAIN.workers.dev'
 $headers = @{ Authorization = "Bearer $adminToken" }
 ```
 
@@ -150,7 +150,7 @@ npx.cmd wrangler deploy
 
 Paste the hex public key, application ID, and guild ID when prompted. Keep the existing `DISCORD_WEBHOOK_URL` (and `ADMIN_TOKEN`) secrets for drop alerts and admin routes. `DISCORD_BOT_TOKEN` is **not** needed at Worker runtime and must not be uploaded as a Worker secret.
 
-3. **Set the Interactions Endpoint URL** in the developer portal to `https://geekhaven-monitor.YOUR-SUBDOMAIN.workers.dev/interactions` (use your real Worker URL). Discord validates the endpoint immediately with a signed PING, so the deployed Worker must already verify signatures. Signature verification follows Discord's [interaction overview](https://docs.discord.com/developers/interactions/overview).
+3. **Set the Interactions Endpoint URL** in the developer portal to `https://site-monitor.YOUR-SUBDOMAIN.workers.dev/interactions` (use your real Worker URL). Discord validates the endpoint immediately with a signed PING, so the deployed Worker must already verify signatures. Signature verification follows Discord's [interaction overview](https://docs.discord.com/developers/interactions/overview).
 
 4. **Register the guild command**. Dry-run (default) needs only the application and guild IDs and prints the single guild `POST` body without calling Discord. `--apply` also needs `DISCORD_BOT_TOKEN` in the **local** environment only. Registration uses a single command create, not a bulk overwrite of unrelated commands ([application commands docs](https://docs.discord.com/developers/interactions/application-commands)):
 
@@ -192,6 +192,39 @@ Example Continente PDP add:
 ```
 
 Before the first add/remove, the Worker uses the bundled `config.json` `sources` as a fallback (two defaults upstream). `/links listar` does **not** create a `source_config` row. After the first mutation, the D1 `source_config` row is the source of truth (including an empty list, which yields `no_sources` until sources are added again). Removing a bundled default keeps it removed. Changes take effect on the next monitor cycle. Re-adding a URL may reuse existing per-source history in `monitor` state; do not assume a fresh baseline. Supported URL shapes still apply; there is no universal arbitrary-site parser. Continente search sources are capped at 5 listing pages and 30 product-detail fetches per check. The registry allows at most 20 sources.
+
+### Diagnosing Discord PING `401`
+
+When Discord saves the Interactions Endpoint URL it sends a signed PING. A `401` means signature verification failed. The Worker does **not** put the reason in the HTTP body (Discord only sees `Invalid request signature`). Instead it writes structured JSON to Cloudflare logs.
+
+`DISCORD_PUBLIC_KEY` (and the application/guild IDs) are **runtime Worker secrets/vars** (Settings → Variables and Secrets, or `wrangler secret put`). They are not Build/CI variables and are not bundled from `config.json`.
+
+**Filter logs**
+
+```powershell
+npx.cmd wrangler tail
+```
+
+In the Workers Logs UI or `wrangler tail` output, search for `discord_verification` (field `event`). Each attempt has a locally generated `diagnostic_id` (`diagnostics_version` is `1`). A successful PING emits two correlated records with the same `diagnostic_id`: verification `reason=signature_ok` then `reason=ping_ok` with `http_status=200`. Failures emit one `warn` record with `http_status=401`.
+
+While Discord retries validation you may see both failed and successful attempts. A later `200` does not erase earlier `401`s in the log stream. **`401` does not automatically mean “wrong public key”** — use `reason` below. These log lines are not returned in the public HTTP response body and must not contain key/signature/body material.
+
+| `reason` | Typical cause | Action |
+| --- | --- | --- |
+| `public_key_missing` | Secret unset/empty at runtime | `wrangler secret put DISCORD_PUBLIC_KEY`, then confirm the secret exists on this Worker |
+| `public_key_type` | Runtime value is not a string | Re-set the secret as plain hex text |
+| `public_key_invalid_hex` | Non-hex characters, or copy/paste quotes/whitespace | Check `key_surrounding_quotes` / `key_leading_trailing_whitespace` flags; paste raw 64-char hex only (no `"` / spaces). Do not trim in code — fix the secret |
+| `public_key_invalid_length` | Hex decodes but not 32 bytes | Use the Discord application **Public Key** (64 hex chars) |
+| `signature_missing` / `signature_invalid_hex` / `signature_invalid_length` | Client/proxy stripped or altered `X-Signature-Ed25519` | Confirm Discord is hitting `/interactions` directly; signature must be 128 hex chars |
+| `timestamp_missing` / `timestamp_invalid_format` | Missing/bad `X-Signature-Timestamp` | Same path/proxy check |
+| `timestamp_outside_window` | Clock skew or replay outside ±300s | Check Worker/system time; retries should be fresh |
+| `body_read_failed` | Request body could not be read | Rare platform/request issue; retry |
+| `public_key_import_failed` | WebCrypto rejected the key bytes | Confirm Ed25519 public key material; see sanitized `error_name` |
+| `signature_verify_failed` | WebCrypto verify threw | See sanitized `error_name`; not the same as mismatch |
+| `signature_mismatch` | Key format OK and signature length OK, but verify returned false | Wrong key for this application, body altered in transit, or signing key mismatch — format validity ≠ crypto accept |
+| `signature_ok` + `ping_ok` | Verification passed; PING answered `{type:1}` | Endpoint validation should succeed |
+
+Already deployed and only refreshing code? Prefer [UPGRADE.md](UPGRADE.md) so you keep the existing Worker and D1 `database_id` instead of creating a new database.
 
 ## Troubleshooting and limits
 

@@ -4,6 +4,17 @@ const SIG_WINDOW_SEC = 300;
 const CAS_RETRIES = 5;
 const MANAGE_GUILD = 32n;
 const ADMINISTRATOR = 8n;
+const DIAGNOSTICS_VERSION = '1';
+const DIAG_EVENT = 'discord_verification';
+const WEB_CRYPTO_ERROR_NAMES = new Set([
+  'DataError',
+  'OperationError',
+  'NotSupportedError',
+  'InvalidAccessError',
+  'TypeError',
+  'QuotaExceededError',
+  'SyntaxError'
+]);
 
 function hexToBytes(hex) {
   if (typeof hex !== 'string' || !/^[0-9a-fA-F]+$/.test(hex) || hex.length % 2) return null;
@@ -17,23 +28,194 @@ function ephemeral(content) {
   return Response.json({ type: 4, data: { content: text, flags: 64, allowed_mentions: { parse: [] } } });
 }
 
-async function verifyDiscordRequest(request, publicKeyHex) {
-  const signatureHex = request.headers.get('X-Signature-Ed25519');
-  const timestamp = request.headers.get('X-Signature-Timestamp');
-  const keyBytes = hexToBytes(publicKeyHex);
-  const sigBytes = hexToBytes(signatureHex);
-  if (!keyBytes || keyBytes.length !== 32 || !sigBytes || sigBytes.length !== 64) return null;
-  if (typeof timestamp !== 'string' || !/^\d+$/.test(timestamp)) return null;
-  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
-  if (age > SIG_WINDOW_SEC) return null;
-  const body = await request.text();
+function typeCategory(value) {
+  if (value === null) return 'null';
+  return typeof value;
+}
+
+function sanitizeErrorName(err) {
+  const name = err && typeof err.name === 'string' ? err.name : 'unknown';
+  return WEB_CRYPTO_ERROR_NAMES.has(name) ? name : 'unknown';
+}
+
+function boundInt(n, max = 10_000_000) {
+  if (!Number.isFinite(n)) return null;
+  return Math.min(Math.max(0, Math.floor(n)), max);
+}
+
+function isValidHex(value) {
+  return typeof value === 'string' && /^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0;
+}
+
+function keyMetadata(publicKeyHex) {
+  const meta = {
+    key_present: publicKeyHex != null && publicKeyHex !== '',
+    key_type: typeCategory(publicKeyHex),
+    key_char_count: null,
+    key_valid_hex: false,
+    key_decoded_byte_count: null,
+    key_leading_trailing_whitespace: false,
+    key_surrounding_quotes: false
+  };
+  if (typeof publicKeyHex !== 'string') return meta;
+  meta.key_char_count = boundInt(publicKeyHex.length, 10_000);
+  meta.key_leading_trailing_whitespace = publicKeyHex.length > 0 && publicKeyHex !== publicKeyHex.trim();
+  meta.key_surrounding_quotes = publicKeyHex.length >= 2 && (
+    (publicKeyHex.startsWith('"') && publicKeyHex.endsWith('"')) ||
+    (publicKeyHex.startsWith("'") && publicKeyHex.endsWith("'"))
+  );
+  meta.key_valid_hex = isValidHex(publicKeyHex);
+  meta.key_decoded_byte_count = meta.key_valid_hex ? boundInt(publicKeyHex.length / 2, 10_000) : null;
+  return meta;
+}
+
+function signatureMetadata(signatureHex, base = {}) {
+  const meta = {
+    ...base,
+    signature_present: signatureHex != null && signatureHex !== '',
+    signature_char_count: null,
+    signature_valid_hex: false,
+    signature_decoded_byte_count: null
+  };
+  if (typeof signatureHex !== 'string') return meta;
+  meta.signature_char_count = boundInt(signatureHex.length, 10_000);
+  meta.signature_valid_hex = isValidHex(signatureHex);
+  meta.signature_decoded_byte_count = meta.signature_valid_hex ? boundInt(signatureHex.length / 2, 10_000) : null;
+  return meta;
+}
+
+function emitDiagnostic(level, record) {
   try {
-    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'Ed25519' }, false, ['verify']);
-    const ok = await crypto.subtle.verify('Ed25519', key, sigBytes, new TextEncoder().encode(timestamp + body));
-    return ok ? body : null;
+    const line = JSON.stringify(record);
+    if (level === 'warn') console.warn(line);
+    else console.info(line);
   } catch {
-    return null;
+    /* logging must never break the request */
   }
+}
+
+async function verifyDiscordRequest(request, publicKeyHex) {
+  const diagnostic_id = crypto.randomUUID();
+  const started = Date.now();
+
+  const stamp = () => ({
+    event: DIAG_EVENT,
+    diagnostics_version: DIAGNOSTICS_VERSION,
+    diagnostic_id,
+    elapsed_ms: boundInt(Date.now() - started, 600_000),
+    allowed_window_sec: SIG_WINDOW_SEC
+  });
+
+  const fail = (reason, stage, extra = {}) => {
+    emitDiagnostic('warn', {
+      ...stamp(),
+      outcome: 'failure',
+      reason,
+      stage,
+      http_status: 401,
+      ...extra
+    });
+    return { body: null, diagnostic_id };
+  };
+
+  const keyMeta = keyMetadata(publicKeyHex);
+  if (publicKeyHex == null || publicKeyHex === '') {
+    return fail('public_key_missing', 'public_key', keyMeta);
+  }
+  if (typeof publicKeyHex !== 'string') {
+    return fail('public_key_type', 'public_key', keyMeta);
+  }
+  if (!keyMeta.key_valid_hex) {
+    return fail('public_key_invalid_hex', 'public_key', keyMeta);
+  }
+  if (keyMeta.key_decoded_byte_count !== 32) {
+    return fail('public_key_invalid_length', 'public_key', keyMeta);
+  }
+  const keyBytes = hexToBytes(publicKeyHex);
+
+  const signatureHex = request.headers.get('X-Signature-Ed25519');
+  const sigMeta = signatureMetadata(signatureHex, keyMeta);
+  if (signatureHex == null || signatureHex === '') {
+    return fail('signature_missing', 'signature', sigMeta);
+  }
+  if (!sigMeta.signature_valid_hex) {
+    return fail('signature_invalid_hex', 'signature', sigMeta);
+  }
+  if (sigMeta.signature_decoded_byte_count !== 64) {
+    return fail('signature_invalid_length', 'signature', sigMeta);
+  }
+  const sigBytes = hexToBytes(signatureHex);
+
+  const timestamp = request.headers.get('X-Signature-Timestamp');
+  const tsMeta = {
+    ...sigMeta,
+    timestamp_present: timestamp != null && timestamp !== '',
+    timestamp_valid_format: typeof timestamp === 'string' && /^\d+$/.test(timestamp),
+    timestamp_age_seconds: null
+  };
+  if (timestamp == null || timestamp === '') {
+    return fail('timestamp_missing', 'timestamp', tsMeta);
+  }
+  if (!tsMeta.timestamp_valid_format) {
+    return fail('timestamp_invalid_format', 'timestamp', tsMeta);
+  }
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  tsMeta.timestamp_age_seconds = boundInt(age, 1_000_000_000);
+  if (age > SIG_WINDOW_SEC) {
+    return fail('timestamp_outside_window', 'timestamp', tsMeta);
+  }
+
+  let body;
+  try {
+    body = await request.text();
+  } catch (err) {
+    return fail('body_read_failed', 'body', {
+      ...tsMeta,
+      error_name: sanitizeErrorName(err)
+    });
+  }
+
+  const bodyMeta = {
+    ...tsMeta,
+    body_utf8_byte_count: boundInt(new TextEncoder().encode(body).length, 10_000_000),
+    crypto_import_ok: false,
+    crypto_verify_completed: false
+  };
+
+  let key;
+  try {
+    key = await crypto.subtle.importKey('raw', keyBytes, { name: 'Ed25519' }, false, ['verify']);
+    bodyMeta.crypto_import_ok = true;
+  } catch (err) {
+    return fail('public_key_import_failed', 'import', {
+      ...bodyMeta,
+      error_name: sanitizeErrorName(err)
+    });
+  }
+
+  let verified;
+  try {
+    verified = await crypto.subtle.verify('Ed25519', key, sigBytes, new TextEncoder().encode(timestamp + body));
+    bodyMeta.crypto_verify_completed = true;
+  } catch (err) {
+    return fail('signature_verify_failed', 'verify', {
+      ...bodyMeta,
+      error_name: sanitizeErrorName(err)
+    });
+  }
+
+  if (!verified) {
+    return fail('signature_mismatch', 'verify', bodyMeta);
+  }
+
+  emitDiagnostic('info', {
+    ...stamp(),
+    outcome: 'success',
+    reason: 'signature_ok',
+    stage: 'verify',
+    ...bodyMeta
+  });
+  return { body, diagnostic_id };
 }
 
 function parseSourcesJson(raw) {
@@ -110,18 +292,42 @@ function formatList(sources) {
   return `${header}${body}`;
 }
 
+function postVerifyDiagnostic(diagnostic_id, reason, stage, http_status, level = 'warn') {
+  emitDiagnostic(level, {
+    event: DIAG_EVENT,
+    diagnostics_version: DIAGNOSTICS_VERSION,
+    diagnostic_id,
+    outcome: reason === 'ping_ok' ? 'success' : 'failure',
+    reason,
+    stage,
+    http_status
+  });
+}
+
 export async function handleLinksInteraction(request, env, defaults, validateSource) {
   try {
     if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
-    const body = await verifyDiscordRequest(request, env.DISCORD_PUBLIC_KEY);
+    const { body, diagnostic_id } = await verifyDiscordRequest(request, env.DISCORD_PUBLIC_KEY);
     if (body === null) return new Response('Invalid request signature', { status: 401 });
 
     let interaction;
-    try { interaction = JSON.parse(body); } catch { return ephemeral('Não foi possível processar o pedido.'); }
-    if (!interaction || typeof interaction !== 'object') return ephemeral('Não foi possível processar o pedido.');
+    try { interaction = JSON.parse(body); } catch {
+      postVerifyDiagnostic(diagnostic_id, 'body_invalid_json', 'parse', 200);
+      return ephemeral('Não foi possível processar o pedido.');
+    }
+    if (!interaction || typeof interaction !== 'object') {
+      postVerifyDiagnostic(diagnostic_id, 'body_invalid_json', 'parse', 200);
+      return ephemeral('Não foi possível processar o pedido.');
+    }
 
-    if (interaction.type === 1) return Response.json({ type: 1 });
-    if (interaction.type !== 2) return ephemeral('Não foi possível processar o pedido.');
+    if (interaction.type === 1) {
+      postVerifyDiagnostic(diagnostic_id, 'ping_ok', 'ping_response', 200, 'info');
+      return Response.json({ type: 1 });
+    }
+    if (interaction.type !== 2) {
+      postVerifyDiagnostic(diagnostic_id, 'unexpected_interaction_type', 'dispatch', 200);
+      return ephemeral('Não foi possível processar o pedido.');
+    }
 
     if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_GUILD_ID) return ephemeral('Não foi possível processar o pedido.');
     if (interaction.application_id !== env.DISCORD_APPLICATION_ID) return ephemeral('Comando indisponível.');
