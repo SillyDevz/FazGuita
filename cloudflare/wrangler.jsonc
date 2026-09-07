@@ -9,6 +9,6 @@
   "d1_databases": [{
     "binding": "DB",
     "database_name": "geekhaven-monitor",
-    "database_id": "REPLACE_WITH_YOUR_DATABASE_ID"
+    "database_id": "45993e27-a9b4-4d09-a79b-a6374c1013a6"
   }]
 }
