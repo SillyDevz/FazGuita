@@ -1386,3 +1386,68 @@ test('malformed monitor mutation options do not mutate settings', async () => {
     }
   } finally { x.sql.close(); }
 });
+
+test('ajuda returns immediate type4 even with waitUntil and never touches followup or DB', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    let waitUntilCalls = 0;
+    let fetcherCalls = 0;
+    let dbCalls = 0;
+    const failingDB = {
+      prepare(query) {
+        dbCalls += 1;
+        throw new Error(`DB should not be called: ${query}`);
+      }
+    };
+    const env = { ...x.env, DB: failingDB };
+    const services = {
+      settingsDefaults: SETTINGS_DEFAULTS,
+      waitUntil() { waitUntilCalls += 1; throw new Error('waitUntil should not run for ajuda'); },
+      async fetcher() { fetcherCalls += 1; throw new Error('fetcher should not run for ajuda'); },
+      async testSource() { throw new Error('testSource should not run'); },
+      async sendTest() { throw new Error('sendTest should not run'); },
+      async getStatus() { throw new Error('getStatus should not run'); }
+    };
+
+    const res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interactionWithToken({ data: { name: 'ajuda' } })),
+      env, DEFAULTS, validateSource, services
+    ));
+    assert.equal(res.status, 200);
+    assert.equal(res.body.type, 4);
+    assert.equal(res.body.data.flags, 64);
+    assert.deepEqual(res.body.data.allowed_mentions, { parse: [] });
+    assert.match(res.body.data.content, /\/links testar/);
+    assert.match(res.body.data.content, /\/monitor/);
+    assert.equal(waitUntilCalls, 0);
+    assert.equal(fetcherCalls, 0);
+    assert.equal(dbCalls, 0);
+
+    const bad = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interactionWithToken({
+        data: { name: 'ajuda', options: [{ name: 'extra', type: 3, value: 'x' }] }
+      })),
+      env, DEFAULTS, validateSource, services
+    ));
+    assert.equal(bad.status, 200);
+    assert.equal(bad.body.type, 4);
+    assert.match(bad.body.data.content, /Não foi possível processar o pedido/);
+    assert.equal(waitUntilCalls, 0);
+    assert.equal(fetcherCalls, 0);
+    assert.equal(dbCalls, 0);
+
+    const denied = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interactionWithToken({
+        member: { permissions: '0' },
+        data: { name: 'ajuda' }
+      })),
+      env, DEFAULTS, validateSource, services
+    ));
+    assert.equal(denied.body.type, 4);
+    assert.match(denied.body.data.content, /Sem permissão/);
+    assert.equal(waitUntilCalls, 0);
+    assert.equal(fetcherCalls, 0);
+    assert.equal(dbCalls, 0);
+  } finally { x.sql.close(); }
+});

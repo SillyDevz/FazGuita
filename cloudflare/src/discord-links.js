@@ -504,6 +504,14 @@ async function runAuthorizedWork(interaction, env, defaults, validateSource, ser
 }
 
 async function respondAuthorized(interaction, env, defaults, validateSource, services) {
+  const name = interaction.data && interaction.data.name;
+  if (name === 'ajuda') {
+    if (interaction.data.options && interaction.data.options.length) {
+      return ephemeral('Não foi possível processar o pedido.');
+    }
+    return ephemeral(helpContent());
+  }
+
   const work = () => runAuthorizedWork(interaction, env, defaults, validateSource, services);
 
   if (typeof services.waitUntil !== 'function') {
