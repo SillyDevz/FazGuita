@@ -1,3 +1,5 @@
+import { handleMonitorSubcommand, helpContent } from './discord-monitor.js';
+
 const MAX_SOURCES = 20;
 const MAX_CONTENT = 2000;
 const SIG_WINDOW_SEC = 300;
@@ -6,6 +8,7 @@ const MANAGE_GUILD = 32n;
 const ADMINISTRATOR = 8n;
 const DIAGNOSTICS_VERSION = '1';
 const DIAG_EVENT = 'discord_verification';
+const FOLLOWUP_EVENT = 'discord_followup';
 const WEB_CRYPTO_ERROR_NAMES = new Set([
   'DataError',
   'OperationError',
@@ -26,6 +29,10 @@ function hexToBytes(hex) {
 function ephemeral(content) {
   const text = content.length > MAX_CONTENT ? content.slice(0, MAX_CONTENT) : content;
   return Response.json({ type: 4, data: { content: text, flags: 64, allowed_mentions: { parse: [] } } });
+}
+
+function deferredEphemeral() {
+  return Response.json({ type: 5, data: { flags: 64 } });
 }
 
 function typeCategory(value) {
@@ -258,8 +265,8 @@ function hasGuildManagePermission(member) {
   }
 }
 
-function subcommand(data) {
-  if (!data || data.name !== 'links' || !Array.isArray(data.options) || data.options.length !== 1) return null;
+function commandSub(data, commandName) {
+  if (!data || data.name !== commandName || !Array.isArray(data.options) || data.options.length !== 1) return null;
   const sub = data.options[0];
   if (!sub || typeof sub.name !== 'string' || sub.type !== 1) return null;
   return sub;
@@ -304,7 +311,231 @@ function postVerifyDiagnostic(diagnostic_id, reason, stage, http_status, level =
   });
 }
 
-export async function handleLinksInteraction(request, env, defaults, validateSource) {
+function isValidInteractionToken(token) {
+  return typeof token === 'string' && token.length >= 10 && token.length <= 512 && /^[A-Za-z0-9._-]+$/.test(token);
+}
+
+function isValidApplicationSnowflake(id) {
+  return typeof id === 'string' && /^\d{17,20}$/.test(id);
+}
+
+const FOLLOWUP_BUDGET_MS = 8000;
+const FOLLOWUP_RETRY_MAX_MS = 2000;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(response) {
+  const header = response.headers && typeof response.headers.get === 'function'
+    ? response.headers.get('Retry-After')
+    : null;
+  if (header && /^\d+(\.\d+)?$/.test(header)) {
+    const ms = Number(header) * 1000;
+    if (Number.isFinite(ms) && ms >= 0) return ms;
+  }
+  return null;
+}
+
+function followupFail(reason, http_status) {
+  const record = {
+    event: FOLLOWUP_EVENT,
+    outcome: 'failure',
+    reason,
+    stage: 'followup'
+  };
+  if (http_status != null) record.http_status = boundInt(http_status, 599);
+  emitDiagnostic('warn', record);
+}
+
+async function patchOriginalResponse(fetcher, applicationId, token, content) {
+  const text = content.length > MAX_CONTENT ? content.slice(0, MAX_CONTENT) : content;
+  const url = `https://discord.com/api/v10/webhooks/${encodeURIComponent(applicationId)}/${encodeURIComponent(token)}/messages/@original`;
+  const body = JSON.stringify({ content: text, allowed_mentions: { parse: [] } });
+  const deadline = Date.now() + FOLLOWUP_BUDGET_MS;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining < 50) {
+      followupFail('patch_budget_exhausted');
+      return;
+    }
+
+    let response;
+    try {
+      response = await fetcher(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(remaining),
+        redirect: 'error'
+      });
+    } catch {
+      followupFail('patch_network_error');
+      return;
+    }
+
+    if (response.ok) {
+      try { await response.arrayBuffer(); } catch { /* ignore */ }
+      return;
+    }
+
+    if (response.status === 429 && attempt === 0) {
+      try { await response.arrayBuffer(); } catch { /* ignore */ }
+      const retryMs = parseRetryAfterMs(response);
+      const waitMs = retryMs == null ? 250 : retryMs;
+      const left = deadline - Date.now();
+      if (waitMs > FOLLOWUP_RETRY_MAX_MS || waitMs > left - 50) {
+        followupFail('patch_failed', 429);
+        return;
+      }
+      await sleep(waitMs);
+      continue;
+    }
+
+    followupFail('patch_failed', response.status);
+    return;
+  }
+}
+
+function formatSourceTestResult(result, canonical) {
+  const url = result && typeof result.url === 'string' && result.url ? result.url : canonical;
+  const products = boundInt(Number(result?.products), 1_000_000) ?? 0;
+  const available = boundInt(Number(result?.available), 1_000_000) ?? 0;
+  const unavailable = boundInt(Number(result?.unavailable), 1_000_000) ?? 0;
+  const unknown = boundInt(Number(result?.unknown), 1_000_000) ?? 0;
+  return [
+    `Teste de fonte (só leitura): ${url}`,
+    `Produtos: ${products}; disponíveis: ${available}; indisponíveis: ${unavailable}; desconhecidos: ${unknown}.`,
+    'Nota: não garante stock posterior.'
+  ].join('\n').slice(0, MAX_CONTENT);
+}
+
+async function runLinksSubcommand(sub, env, defaults, validateSource, services) {
+  if (sub.name === 'listar') {
+    if (sub.options && sub.options.length) return 'Não foi possível processar o pedido.';
+    return formatList(await getSources(env, defaults));
+  }
+
+  if (sub.name === 'adicionar' || sub.name === 'remover') {
+    const rawUrl = optionUrl(sub);
+    if (rawUrl === null) return 'Não foi possível processar o pedido.';
+    let canonical;
+    try { canonical = validateSource(rawUrl); } catch { return 'URL inválida.'; }
+    if (typeof canonical !== 'string' || !canonical) return 'URL inválida.';
+
+    if (sub.name === 'adicionar') {
+      const result = await mutateSources(env, defaults, current => {
+        if (current.includes(canonical)) return current;
+        if (current.length >= MAX_SOURCES) {
+          const err = new Error('max');
+          err.code = 'max';
+          throw err;
+        }
+        return [...current, canonical];
+      }).catch(err => {
+        if (err && err.code === 'max') return { sources: null, changed: false, max: true };
+        throw err;
+      });
+      if (result.max) return 'Limite de 20 fontes atingido.';
+      if (!result.changed) return `A fonte já estava na lista: ${canonical}`;
+      return `Fonte adicionada: ${canonical}`;
+    }
+
+    const result = await mutateSources(env, defaults, current => {
+      if (!current.includes(canonical)) return current;
+      return current.filter(url => url !== canonical);
+    });
+    if (!result.changed) return `A fonte não estava na lista: ${canonical}`;
+    return `Fonte removida: ${canonical}`;
+  }
+
+  if (sub.name === 'testar') {
+    const rawUrl = optionUrl(sub);
+    if (rawUrl === null) return 'Não foi possível processar o pedido.';
+    let canonical;
+    try { canonical = validateSource(rawUrl); } catch { return 'URL inválida.'; }
+    if (typeof canonical !== 'string' || !canonical) return 'URL inválida.';
+    if (typeof services.testSource !== 'function') return 'Não foi possível testar a fonte.';
+    try {
+      const result = await services.testSource(rawUrl);
+      return formatSourceTestResult(result, canonical);
+    } catch (err) {
+      const name = err && typeof err.name === 'string' ? err.name : '';
+      const code = err && typeof err.code === 'string' ? err.code : '';
+      const message = err && typeof err.message === 'string' ? err.message : '';
+      if (
+        name === 'TimeoutError' ||
+        name === 'AbortError' ||
+        code === 'timeout' ||
+        code === 'TIMEOUT' ||
+        message === 'Request or processing failed'
+      ) {
+        return 'Não foi possível concluir o teste da fonte.';
+      }
+      return 'Não foi possível testar a fonte.';
+    }
+  }
+
+  return 'Não foi possível processar o pedido.';
+}
+
+async function runAuthorizedWork(interaction, env, defaults, validateSource, services) {
+  const name = interaction.data && interaction.data.name;
+
+  if (name === 'ajuda') {
+    if (interaction.data.options && interaction.data.options.length) return 'Não foi possível processar o pedido.';
+    return helpContent();
+  }
+
+  if (name === 'links') {
+    const sub = commandSub(interaction.data, 'links');
+    if (!sub) return 'Não foi possível processar o pedido.';
+    return runLinksSubcommand(sub, env, defaults, validateSource, services);
+  }
+
+  if (name === 'monitor') {
+    const sub = commandSub(interaction.data, 'monitor');
+    if (!sub) return 'Não foi possível processar o pedido.';
+    return handleMonitorSubcommand(sub, interaction, env, services);
+  }
+
+  return 'Não foi possível processar o pedido.';
+}
+
+async function respondAuthorized(interaction, env, defaults, validateSource, services) {
+  const work = () => runAuthorizedWork(interaction, env, defaults, validateSource, services);
+
+  if (typeof services.waitUntil !== 'function') {
+    try {
+      return ephemeral(await work());
+    } catch {
+      return ephemeral('Não foi possível processar o pedido.');
+    }
+  }
+
+  const token = interaction.token;
+  const applicationId = env.DISCORD_APPLICATION_ID;
+  if (!isValidInteractionToken(token) || !isValidApplicationSnowflake(applicationId)) {
+    return ephemeral('Não foi possível processar o pedido.');
+  }
+
+  const fetcher = typeof services.fetcher === 'function' ? services.fetcher : fetch;
+  services.waitUntil((async () => {
+    let content;
+    try {
+      content = await work();
+    } catch {
+      content = 'Não foi possível processar o pedido.';
+    }
+    if (typeof content !== 'string') content = 'Não foi possível processar o pedido.';
+    await patchOriginalResponse(fetcher, applicationId, token, content);
+  })());
+
+  return deferredEphemeral();
+}
+
+export async function handleLinksInteraction(request, env, defaults, validateSource, services = {}) {
   try {
     if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
     const { body, diagnostic_id } = await verifyDiscordRequest(request, env.DISCORD_PUBLIC_KEY);
@@ -334,48 +565,7 @@ export async function handleLinksInteraction(request, env, defaults, validateSou
     if (!interaction.guild_id || interaction.guild_id !== env.DISCORD_GUILD_ID) return ephemeral('Comando indisponível.');
     if (!hasGuildManagePermission(interaction.member)) return ephemeral('Sem permissão para gerir fontes.');
 
-    const sub = subcommand(interaction.data);
-    if (!sub) return ephemeral('Não foi possível processar o pedido.');
-
-    if (sub.name === 'listar') {
-      if (sub.options && sub.options.length) return ephemeral('Não foi possível processar o pedido.');
-      return ephemeral(formatList(await getSources(env, defaults)));
-    }
-
-    if (sub.name === 'adicionar' || sub.name === 'remover') {
-      const rawUrl = optionUrl(sub);
-      if (rawUrl === null) return ephemeral('Não foi possível processar o pedido.');
-      let canonical;
-      try { canonical = validateSource(rawUrl); } catch { return ephemeral('URL inválida.'); }
-      if (typeof canonical !== 'string' || !canonical) return ephemeral('URL inválida.');
-
-      if (sub.name === 'adicionar') {
-        const result = await mutateSources(env, defaults, current => {
-          if (current.includes(canonical)) return current;
-          if (current.length >= MAX_SOURCES) {
-            const err = new Error('max');
-            err.code = 'max';
-            throw err;
-          }
-          return [...current, canonical];
-        }).catch(err => {
-          if (err && err.code === 'max') return { sources: null, changed: false, max: true };
-          throw err;
-        });
-        if (result.max) return ephemeral('Limite de 20 fontes atingido.');
-        if (!result.changed) return ephemeral(`A fonte já estava na lista: ${canonical}`);
-        return ephemeral(`Fonte adicionada: ${canonical}`);
-      }
-
-      const result = await mutateSources(env, defaults, current => {
-        if (!current.includes(canonical)) return current;
-        return current.filter(url => url !== canonical);
-      });
-      if (!result.changed) return ephemeral(`A fonte não estava na lista: ${canonical}`);
-      return ephemeral(`Fonte removida: ${canonical}`);
-    }
-
-    return ephemeral('Não foi possível processar o pedido.');
+    return respondAuthorized(interaction, env, defaults, validateSource, services);
   } catch {
     return ephemeral('Não foi possível processar o pedido.');
   }

@@ -1,4 +1,9 @@
 import settings from '../config.json' with { type: 'json' };
+import {
+  formatNotification,
+  getMonitorSettings,
+  validateMonitorSettings
+} from './monitor-settings.js';
 
 const defaultSource = 'https://geekhaven.pt/collections/pokemon';
 
@@ -262,15 +267,46 @@ function webhookURL(env) {
   return url;
 }
 
-export async function sendDiscord(env, event, fetcher = fetch) {
+function successDelayMs(config) {
+  const seconds = Number.isInteger(config.checkIntervalSeconds) ? config.checkIntervalSeconds : 60;
+  return Math.max(55000, seconds * 1000 - 5000);
+}
+
+function notificationSettingsFrom(config) {
+  if (!config || config.mentionUserIds == null || config.messageTemplate == null || config.webhookUsername == null) return undefined;
+  try {
+    return validateMonitorSettings({
+      enabled: typeof config.enabled === 'boolean' ? config.enabled : true,
+      alertOnNewProducts: typeof config.alertOnNewProducts === 'boolean' ? config.alertOnNewProducts : true,
+      alertOnRestocks: typeof config.alertOnRestocks === 'boolean' ? config.alertOnRestocks : true,
+      alertOnSoldOutListings: typeof config.alertOnSoldOutListings === 'boolean' ? config.alertOnSoldOutListings : false,
+      includeKeywords: Array.isArray(config.includeKeywords) ? config.includeKeywords : [],
+      excludeKeywords: Array.isArray(config.excludeKeywords) ? config.excludeKeywords : [],
+      checkIntervalSeconds: Number.isInteger(config.checkIntervalSeconds) ? config.checkIntervalSeconds : 60,
+      mentionUserIds: config.mentionUserIds,
+      messageTemplate: config.messageTemplate,
+      webhookUsername: config.webhookUsername
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+export async function sendDiscord(env, event, fetcher = fetch, notificationSettings) {
+  const extras = notificationSettings
+    ? formatNotification(event, notificationSettings)
+    : { username: 'Geek Haven Monitor', allowed_mentions: { parse: [] } };
+  const payload = {
+    username: extras.username,
+    allowed_mentions: extras.allowed_mentions,
+    embeds: [{ title: `${event.kind}: ${event.title}`.slice(0, 256), url: event.url,
+      description: event.available ? 'In stock' : 'Sold out', color: event.kind === 'TEST' ? 3447003 : 5763719 }]
+  };
+  if (extras.content !== undefined) payload.content = extras.content;
   const response = await fetcher(webhookURL(env), {
-    method: 'POST', signal: AbortSignal.timeout(10000),
+    method: 'POST', signal: AbortSignal.timeout(10000), redirect: 'error',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      username: 'Geek Haven Monitor', allowed_mentions: { parse: [] },
-      embeds: [{ title: `${event.kind}: ${event.title}`.slice(0, 256), url: event.url,
-        description: event.available ? 'In stock' : 'Sold out', color: event.kind === 'TEST' ? 3447003 : 5763719 }]
-    })
+    body: JSON.stringify(payload)
   });
   if (!response.ok) {
     const error = new Error(`Discord HTTP ${response.status}`);
@@ -297,13 +333,69 @@ function defaultSourceUrls(values = settings.sources) {
 export async function configuredCheck(env, config = settings, fetcher = fetch) {
   const { getSources } = await import('./discord-links.js');
   const configured = await getSources(env, defaultSourceUrls(config.sources));
-  return runCheck(env, { ...config, sources: configured }, fetcher);
+  const runtime = await getMonitorSettings(env, settings);
+  return runCheck(env, { ...runtime, sources: configured }, fetcher);
+}
+
+export async function testSourceUrl(rawUrl, fetcher = fetch) {
+  const source = sourcesFor([rawUrl])[0];
+  const deadline = AbortSignal.timeout(20000);
+  const bounded = (url, options = {}) => {
+    const signal = options.signal ? AbortSignal.any([deadline, options.signal]) : deadline;
+    return fetcher(url, { ...options, signal });
+  };
+  let result;
+  try {
+    result = await readSource(source, {}, bounded);
+  } catch (error) {
+    if (deadline.aborted) throw new Error('Request or processing failed');
+    throw error;
+  }
+  if (deadline.aborted) throw new Error('Request or processing failed');
+  const products = result?.products || [];
+  let available = 0, unavailable = 0, unknown = 0;
+  for (const p of products) {
+    if (p.available === true) available++;
+    else if (p.available === false) unavailable++;
+    else unknown++;
+  }
+  return { url: source.url, products: products.length, available, unavailable, unknown };
+}
+
+export async function getMonitorStatus(env, config = settings) {
+  const { getSources } = await import('./discord-links.js');
+  const runtime = await getMonitorSettings(env, settings);
+  const configured = await getSources(env, defaultSourceUrls(config.sources));
+  const row = await env.DB.prepare('SELECT state FROM monitor WHERE id = 1').first();
+  const parsed = row?.state ? JSON.parse(row.state) : {};
+  const { known, pending, ...state } = parsed;
+  const sources = Object.fromEntries(Object.entries(state.sources || {}).map(([url, { known: _k, ...history }]) => [url, history]));
+  return {
+    ...state,
+    configured,
+    sources,
+    pending: pending?.length || 0,
+    enabled: runtime.enabled,
+    settings: runtime
+  };
+}
+
+export async function sendTestNotification(env, config = settings, fetcher = fetch) {
+  const runtime = await getMonitorSettings(env, settings);
+  await sendDiscord(env, {
+    kind: 'TEST',
+    title: 'Notifications are working - this is not a real drop',
+    available: true,
+    url: 'https://geekhaven.pt/collections/pokemon'
+  }, fetcher, runtime);
+  return { status: 'test sent' };
 }
 
 export async function runCheck(env, config = settings, fetcher = fetch) {
   config = { alertOnSoldOutListings: false, ...config };
   validate(config);
   const sources = resolveSources(config.sources);
+  const notificationSettings = notificationSettingsFrom(config);
   if (!config.enabled) return { status: 'paused' };
   const token = crypto.randomUUID();
   const now = Date.now();
@@ -358,7 +450,7 @@ export async function runCheck(env, config = settings, fetcher = fetch) {
             history.lastCheck = Date.now();
             history.failures = 0;
             history.lastError = null;
-            history.nextCheck = Date.now() + 55000;
+            history.nextCheck = Date.now() + successDelayMs(config);
           } catch (error) {
             history.failures = (history.failures || 0) + 1;
             history.lastError = /^(Store HTTP \d+|Invalid product feed|Collection exceeds pagination limit|Search exceeds pagination limit)$/.test(error.message) ? error.message : 'Request or processing failed';
@@ -372,14 +464,14 @@ export async function runCheck(env, config = settings, fetcher = fetch) {
       state.pending = state.pending.filter(event => !event.sourceUrl || active.has(event.sourceUrl));
       let sent = 0;
       while (state.pending.length && sent < 5) {
-        await sendDiscord(env, state.pending[0], fetcher);
+        await sendDiscord(env, state.pending[0], fetcher, notificationSettings);
         state.pending.shift();
         sent++;
         await save(state);
       }
       state.failures = 0;
       state.lastError = null;
-      state.nextCheck = Date.now() + 55000;
+      state.nextCheck = Date.now() + successDelayMs(config);
       await save(state);
       return { status: errors.length === sources.length ? (errors.every(e => e.status === 'blocked') ? 'blocked' : 'error') : 'ok', errors, products: sources.reduce((n, s) => n + (state.sources[s.url]?.productCount || 0), 0), sent, pending: state.pending.length };
     } catch (error) {
@@ -399,29 +491,49 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(configuredCheck(env).then(result => console.log(JSON.stringify(result))));
   },
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
-    if (path === '/health') return Response.json({ service: 'geekhaven-monitor', enabled: settings.enabled });
+    // Interactions (including signed PING) must not touch monitor_settings / D1.
     if (request.method === 'POST' && path === '/interactions') {
       const { handleLinksInteraction } = await import('./discord-links.js');
-      return handleLinksInteraction(request, env, defaultSourceUrls(), url => sourcesFor([url])[0].url);
+      return handleLinksInteraction(
+        request,
+        env,
+        defaultSourceUrls(),
+        url => sourcesFor([url])[0].url,
+        {
+          settingsDefaults: settings,
+          testSource: rawUrl => testSourceUrl(rawUrl),
+          sendTest: () => sendTestNotification(env),
+          getStatus: () => getMonitorStatus(env),
+          waitUntil: ctx?.waitUntil ? promise => ctx.waitUntil(promise) : undefined,
+          fetcher: fetch
+        }
+      );
+    }
+    if (path === '/health') {
+      try {
+        const runtime = await getMonitorSettings(env, settings);
+        return Response.json({ service: 'geekhaven-monitor', enabled: runtime.enabled });
+      } catch {
+        return Response.json({ error: 'Service unavailable' }, { status: 503 });
+      }
     }
     if (!env.ADMIN_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.ADMIN_TOKEN}`) return new Response('Unauthorized', { status: 401 });
     try {
       if (request.method === 'GET' && path === '/status') {
-        const { getSources } = await import('./discord-links.js');
-        const configured = await getSources(env, defaultSourceUrls());
-        const row = await env.DB.prepare('SELECT state FROM monitor WHERE id = 1').first();
-        const { known, pending, ...state } = JSON.parse(row.state);
-        const sources = Object.fromEntries(Object.entries(state.sources || {}).map(([url, { known, ...history }]) => [url, history]));
-        return Response.json({ enabled: settings.enabled, ...state, configured, sources, pending: pending?.length || 0 });
+        return Response.json(await getMonitorStatus(env));
       }
       if (request.method === 'POST' && path === '/test') {
-        await sendDiscord(env, { kind: 'TEST', title: 'Notifications are working - this is not a real drop', available: true, url: 'https://geekhaven.pt/collections/pokemon' });
-        return Response.json({ status: 'test sent' });
+        return Response.json(await sendTestNotification(env));
       }
       if (request.method === 'POST' && path === '/check') return Response.json(await configuredCheck(env));
       return new Response('Not found', { status: 404 });
-    } catch { return Response.json({ error: 'Operation failed. Check database bindings and secrets.' }, { status: 500 }); }
+    } catch (error) {
+      if (error && error.message === 'Discord HTTP 429') {
+        return Response.json({ error: 'Rate limited' }, { status: 429 });
+      }
+      return Response.json({ error: 'Operation failed. Check database bindings and secrets.' }, { status: 500 });
+    }
   }
 };

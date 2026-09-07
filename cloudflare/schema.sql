@@ -11,3 +11,9 @@ CREATE TABLE IF NOT EXISTS source_config (
   sources TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS monitor_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  settings TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 0
+);

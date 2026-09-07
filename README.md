@@ -3,16 +3,16 @@
 FazGuita watches supported store URLs for new Pokemon products and restocks. Two run modes are included and stay independent:
 
 - **Windows local:** run `Start-Monitor.cmd` for terminal checks and MP3 alerts. It uses this repo’s root `config.json` only.
-- **Cloudflare + Discord:** follow the cloud guides for one-minute checks with the PC off. After deploy, Discord `/links adicionar`, `/links listar`, and `/links remover` manage that Worker’s source list in D1 without touching the Windows monitor.
+- **Cloudflare + Discord:** follow the cloud guides for one-minute checks with the PC off. After deploy, Discord `/links`, `/monitor`, and `/ajuda` manage that Worker’s sources and runtime settings in D1 without touching the Windows monitor.
 
 **Cloudflare setup paths**
 
 - New install: [cloudflare/SETUP.md](cloudflare/SETUP.md)
 - Upgrade an existing Worker: [cloudflare/UPGRADE.md](cloudflare/UPGRADE.md)
 - Connect that existing Worker to GitHub Builds: [cloudflare/UPGRADE.md — Connect the existing Worker to GitHub](cloudflare/UPGRADE.md#connect-the-existing-worker-to-github)
-- Discord application + slash commands (after Worker basics): [cloudflare/SETUP.md §8](cloudflare/SETUP.md#8-discord-slash-commands-for-source-urls)
+- Discord application + slash commands (after Worker basics): [cloudflare/SETUP.md §8](cloudflare/SETUP.md#8-discord-slash-commands)
 
-Pushing `main` updates the git repo. It does **not** update a deployed Worker unless you also connect Cloudflare Builds (or another CI) to that branch. How: [UPGRADE.md § Connect the existing Worker to GitHub](cloudflare/UPGRADE.md#connect-the-existing-worker-to-github). If `main` is wired to auto-deploy, apply D1 schema **before** that deploy can race ahead of the new `source_config` table; schema-first is advised.
+Pushing `main` updates the git repo. It does **not** update a deployed Worker unless you also connect Cloudflare Builds (or another CI) to that branch. How: [UPGRADE.md § Connect the existing Worker to GitHub](cloudflare/UPGRADE.md#connect-the-existing-worker-to-github). If `main` is wired to auto-deploy, apply D1 schema **before** that deploy can race ahead of tables the new code expects; schema-first is advised. The `monitor_settings` table is also auto-created non-destructively on first settings use, so this settings feature does not need a separate manual migration on an existing schema that already has `monitor` / `source_config`.
 
 ## Source links
 
@@ -115,8 +115,29 @@ Minimum configurable interval is 10 seconds. `-TestSound` makes no network reque
 
 ## Cloudflare + Discord (summary)
 
-The Worker checks about once per minute, stores history and pending alerts in D1, and posts matching products to Discord. Bundled filter flags (`enabled`, alert toggles, keywords) ship in `cloudflare/config.json` and require a redeploy to change. Upstream ships with `"enabled": false`, so a blind deploy stays paused until you set `enabled` to `true` and redeploy. Monitored URLs are dynamic via D1 `source_config` after the first `/links` add/remove; listing alone does not create that row. The `source_config` **table** must exist (apply `schema.sql`); fallback to the two bundled defaults applies only when that table’s singleton **row** is missing.
+The Worker checks about once per minute (cron still `* * * * *`; `checkIntervalSeconds` is an approximate spacing hint and backoff can delay further), stores history and pending alerts in D1, and posts matching products to Discord.
 
-Admin diagnostics: `/health` (liveness + bundled `enabled`), `/status` (nested per-source history under `sources`, plus `configured`), `/check`, `/test`. Check results can report `paused`, `waiting`, `no_sources`, `ok`, `blocked`, or `error`. Pending alerts and history are preserved across pauses.
+Runtime settings (enablement, alert toggles, keywords, interval, webhook username, mention list, message template) live in a D1 singleton `monitor_settings` alongside unchanged `source_config` and `monitor`. D1 values override bundled `cloudflare/config.json` defaults and survive redeploy. Sources keep existing D1 `source_config` semantics. The `monitor_settings` table is in `schema.sql` and is also auto-created non-destructively on first settings use; no separate manual migration is required for this settings feature on an existing schema. Fresh installs still apply the full schema.
+
+Bundled `cloudflare/config.json` ships `"enabled": true` for this authorized deployment (root Windows `config.json` is untouched). New installs should explicitly set `"enabled": false` before the first deploy until secrets and schema are ready, then start with `/monitor iniciar`. Source URLs, filters, mentions, template, and other runtime settings apply via Discord without redeploy. Infrastructure secrets, cron, and hard caps are not user commands.
+
+Admin diagnostics: `/health` reports effective `enabled` (D1 override when present); `/status` uses dynamic settings and nested per-source history under `sources`, plus `configured`; `/check`, `/test`. Check results can report `paused`, `waiting`, `no_sources`, `ok`, `blocked`, or `error`. Pending alerts and history are preserved across pauses. Settings take effect on the next operation/check; an already-running scan or send may finish with the settings it loaded (no mid-fetch cancel or live swap). Pending alerts use current notification settings (mentions/template) for their delivery run, not a snapshot stored at detection. Filters that already queued an alert are not re-evaluated retroactively.
+
+Slash commands (Manage Guild or Administrator; correct application + guild only; ephemeral private replies with no mentions):
+
+| Command | Purpose |
+| --- | --- |
+| `/links adicionar` `/links listar` `/links remover` | Manage source URLs in D1 |
+| `/links testar url:SOURCE` | Real fetch + strict parser (≤20s); allowed while paused; no add / no state / no notifications |
+| `/monitor iniciar` `/monitor pausar` `/monitor estado` | Start, pause, status (per-source baseline/products/last scan/errors; no `/start`) |
+| `/monitor testar` | Real labelled **TEST** to the existing webhook (uses mentions/template even while paused; not restock proof) |
+| `/monitor marcar` `/monitor desmarcar` `/monitor mencoes` | Explicit user mention allowlist (max 20; no everyone/here/roles) |
+| `/monitor mensagem` `/monitor repor_mensagem` | Custom template / restore default |
+| `/monitor configurar` | Runtime options (see SETUP) |
+| `/ajuda` | Static help |
+
+Default mention list is `['207557157858574337']`. Removing it persists and is not re-added on deploy; new bundled defaults do not override saved settings. Template placeholders: `{mencoes}`, `{tipo}`, `{produto}`, `{url}`, `{estado}`, `{loja}` (no price). Default template `{mencoes}` adds tags above the existing truthful embed. **TEST** always keeps an explicit label.
+
+After a code upgrade that adds `/monitor` and `/ajuda`, rerun the registration script once (`--apply` upserts the three guild commands individually). Bot token stays local for registration only.
 
 Cloudflare Worker tests need **Node.js 22+** (`node:sqlite` / `DatabaseSync`). See [SETUP.md](cloudflare/SETUP.md) for a clean install and [UPGRADE.md](cloudflare/UPGRADE.md) to refresh an existing Worker without creating a new database.

@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "sources": [
     "https://geekhaven.pt/collections/pokemon",
     "https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01"
@@ -8,5 +8,9 @@
   "alertOnRestocks": true,
   "alertOnSoldOutListings": false,
   "includeKeywords": [],
-  "excludeKeywords": []
+  "excludeKeywords": [],
+  "checkIntervalSeconds": 60,
+  "mentionUserIds": ["207557157858574337"],
+  "messageTemplate": "{mencoes}",
+  "webhookUsername": "PokeBot"
 }

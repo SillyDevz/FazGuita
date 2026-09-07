@@ -3,11 +3,32 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { getSources, handleLinksInteraction } from '../src/discord-links.js';
-import { linksCommand, registrationRequest, main } from '../scripts/register-commands.mjs';
+import { getMonitorSettings } from '../src/monitor-settings.js';
+import {
+  linksCommand,
+  monitorCommand,
+  helpCommand,
+  commands,
+  registrationRequest,
+  main
+} from '../scripts/register-commands.mjs';
 
 const APP = '123456789012345678';
 const GUILD = '987654321098765432';
 const DEFAULTS = ['https://geekhaven.pt/collections/pokemon'];
+const SETTINGS_DEFAULTS = {
+  enabled: false,
+  alertOnNewProducts: true,
+  alertOnRestocks: true,
+  alertOnSoldOutListings: false,
+  includeKeywords: [],
+  excludeKeywords: [],
+  checkIntervalSeconds: 60,
+  mentionUserIds: ['207557157858574337'],
+  messageTemplate: '{mencoes}',
+  webhookUsername: 'PokeBot'
+};
+const INTERACTION_TOKEN = 'interaction.token.value_for_tests-01';
 
 function bytesToHex(bytes) {
   return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
@@ -130,7 +151,26 @@ test('registration command definition snowflakes dry-run and apply errors', asyn
   assert.equal(linksCommand.name, 'links');
   assert.equal(linksCommand.type, 1);
   assert.equal(linksCommand.default_member_permissions, '32');
-  assert.deepEqual(linksCommand.options.map(o => o.name), ['adicionar', 'listar', 'remover']);
+  assert.deepEqual(linksCommand.options.map(o => o.name), ['adicionar', 'listar', 'remover', 'testar']);
+  assert.equal(monitorCommand.name, 'monitor');
+  assert.equal(monitorCommand.default_member_permissions, '32');
+  assert.equal(helpCommand.name, 'ajuda');
+  assert.equal(helpCommand.default_member_permissions, '32');
+  assert.deepEqual(commands.map(c => c.name), ['links', 'monitor', 'ajuda']);
+  assert.ok(monitorCommand.options.some(o => o.name === 'configurar'));
+  const configurar = monitorCommand.options.find(o => o.name === 'configurar');
+  assert.deepEqual(
+    configurar.options.find(o => o.name === 'opcao').choices.map(c => c.value),
+    [
+      'alertOnNewProducts',
+      'alertOnRestocks',
+      'alertOnSoldOutListings',
+      'includeKeywords',
+      'excludeKeywords',
+      'checkIntervalSeconds',
+      'webhookUsername'
+    ]
+  );
 
   const req = registrationRequest({ DISCORD_APPLICATION_ID: APP, DISCORD_GUILD_ID: GUILD });
   assert.equal(req.method, 'POST');
@@ -148,12 +188,33 @@ test('registration command definition snowflakes dry-run and apply errors', asyn
   console.error = (...args) => logs.push(['err', ...args]);
   try {
     await main([], { DISCORD_APPLICATION_ID: APP, DISCORD_GUILD_ID: GUILD });
-    assert.ok(logs.some(([kind, msg]) => kind === 'log' && String(msg).includes('"dryRun": true')));
+    const dry = logs.find(([kind, msg]) => kind === 'log' && String(msg).includes('"dryRun": true'));
+    assert.ok(dry);
+    const dryPayload = JSON.parse(dry[1]);
+    assert.equal(dryPayload.commands.length, 3);
+    assert.deepEqual(dryPayload.commands.map(c => c.name), ['links', 'monitor', 'ajuda']);
 
     process.exitCode = 0;
+    logs.length = 0;
+    const calls = [];
+    await main(['--apply'], { DISCORD_APPLICATION_ID: APP, DISCORD_GUILD_ID: GUILD, DISCORD_BOT_TOKEN: 'tok' }, async (url, init) => {
+      calls.push({ url, body: JSON.parse(init.body) });
+      if (calls.length === 2) return { ok: false, status: 500 };
+      return { ok: true, status: 200 };
+    });
+    assert.equal(process.exitCode, 1);
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls.map(c => c.body.name), ['links', 'monitor', 'ajuda']);
+    assert.ok(logs.some(([kind, msg]) => kind === 'log' && msg === 'Registered /links guild command'));
+    assert.ok(logs.some(([kind, msg]) => kind === 'err' && msg === 'Discord command registration failed: monitor'));
+    assert.ok(logs.some(([kind, msg]) => kind === 'log' && msg === 'Registered /ajuda guild command'));
+    assert.equal(JSON.stringify(logs).includes('tok'), false);
+
+    process.exitCode = 0;
+    logs.length = 0;
     await main(['--apply'], { DISCORD_APPLICATION_ID: APP, DISCORD_GUILD_ID: GUILD, DISCORD_BOT_TOKEN: 'tok' }, async () => { throw new Error('network'); });
     assert.equal(process.exitCode, 1);
-    assert.ok(logs.some(([kind, msg]) => kind === 'err' && msg === 'Discord command registration failed'));
+    assert.equal(logs.filter(([kind, msg]) => kind === 'err' && String(msg).startsWith('Discord command registration failed:')).length, 3);
   } finally {
     console.log = origLog;
     console.error = origErr;
@@ -729,4 +790,599 @@ test('signed ping succeeds when DB unavailable', async () => {
   assert.equal(d[1].reason, 'ping_ok');
   assert.equal(d[1].http_status, 200);
   assertNoSensitive(logs, [publicKey, 'db down']);
+});
+
+function monitorData(name, options) {
+  const sub = { name, type: 1 };
+  if (options) sub.options = options;
+  return { name: 'monitor', options: [sub] };
+}
+
+function interactionWithToken(overrides = {}) {
+  return interaction({ token: INTERACTION_TOKEN, ...overrides });
+}
+
+test('ajuda and links testar readonly with private results', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    const monitorBefore = x.monitorState();
+    const sourcesBefore = await getSources(x.env, DEFAULTS);
+
+    let res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: { name: 'ajuda' } })),
+      x.env, DEFAULTS, validateSource, { settingsDefaults: SETTINGS_DEFAULTS }
+    ));
+    assert.equal(res.body.type, 4);
+    assert.equal(res.body.data.flags, 64);
+    assert.deepEqual(res.body.data.allowed_mentions, { parse: [] });
+    assert.match(res.body.data.content, /\/links testar/);
+    assert.match(res.body.data.content, /\/monitor/);
+    assert.match(res.body.data.content, /\{mencoes\}/);
+    assert.match(res.body.data.content, /limpar/);
+    assert.ok(res.body.data.content.length <= 2000);
+
+    let testSourceCalls = 0;
+    const services = {
+      settingsDefaults: SETTINGS_DEFAULTS,
+      async testSource(rawUrl) {
+        testSourceCalls += 1;
+        return { url: validateSource(rawUrl), products: 3, available: 1, unavailable: 1, unknown: 1 };
+      },
+      async sendTest() { throw new Error('should not send'); }
+    };
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: linksData('testar', 'https://shop.test/collections/cards/products.json?x=1')
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.equal(testSourceCalls, 1);
+    assert.match(res.body.data.content, /só leitura/);
+    assert.match(res.body.data.content, /disponíveis: 1/);
+    assert.match(res.body.data.content, /indisponíveis: 1/);
+    assert.deepEqual(res.body.data.allowed_mentions, { parse: [] });
+    assert.deepEqual(await getSources(x.env, DEFAULTS), sourcesBefore);
+    assert.equal(x.sql.prepare('SELECT COUNT(*) AS n FROM source_config').get().n, 0);
+    assert.deepEqual(x.monitorState(), monitorBefore);
+
+    const timeoutErr = new Error('Request or processing failed');
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: linksData('testar', 'https://shop.test/collections/cards')
+      })),
+      x.env, DEFAULTS, validateSource, {
+        settingsDefaults: SETTINGS_DEFAULTS,
+        async testSource() { throw timeoutErr; }
+      }
+    ));
+    assert.match(res.body.data.content, /Não foi possível concluir o teste da fonte/);
+    assert.equal(res.body.data.content.includes('Request or processing failed'), false);
+    assert.deepEqual(await getSources(x.env, DEFAULTS), sourcesBefore);
+  } finally { x.sql.close(); }
+});
+
+test('unauthorized monitor and testar never read mutate or send', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    let touched = 0;
+    const services = {
+      settingsDefaults: SETTINGS_DEFAULTS,
+      async testSource() { touched += 1; return { url: 'x', products: 0, available: 0, unavailable: 0, unknown: 0 }; },
+      async sendTest() { touched += 1; },
+      async getStatus() { touched += 1; return { enabled: false }; }
+    };
+
+    const cases = [
+      interaction({ member: { permissions: '0' }, data: monitorData('estado') }),
+      interaction({ member: { permissions: '0' }, data: monitorData('testar') }),
+      interaction({ member: { permissions: '0' }, data: linksData('testar', 'https://shop.test/collections/cards') }),
+      interaction({ application_id: '999', data: monitorData('iniciar') }),
+      interaction({ guild_id: '111', data: { name: 'ajuda' } })
+    ];
+
+    for (const body of cases) {
+      const res = await json(await handleLinksInteraction(
+        await signedRequest(keyPair.privateKey, body),
+        x.env, DEFAULTS, validateSource, services
+      ));
+      assert.equal(res.body.type, 4);
+      assert.equal(touched, 0);
+      assert.equal(x.sql.prepare('SELECT COUNT(*) AS n FROM monitor_settings').get().n, 0);
+      assert.equal(x.sql.prepare('SELECT COUNT(*) AS n FROM source_config').get().n, 0);
+      assert.match(res.body.data.content, /Comando indisponível|Sem permissão/);
+    }
+  } finally { x.sql.close(); }
+});
+
+test('deferred ack then patch for slow services without leaking tokens', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const patches = [];
+    let deferredResolved = false;
+    const background = [];
+
+    const services = {
+      settingsDefaults: SETTINGS_DEFAULTS,
+      waitUntil(promise) { background.push(promise); },
+      async fetcher(url, init) {
+        patches.push({ url, method: init.method, body: JSON.parse(init.body), headers: init.headers, redirect: init.redirect });
+        assert.equal(url.includes(INTERACTION_TOKEN), true);
+        assert.equal(url.includes(encodeURIComponent(INTERACTION_TOKEN)), true);
+        assert.equal(init.signal instanceof AbortSignal, true);
+        return { ok: true, status: 200, async arrayBuffer() { return new ArrayBuffer(0); }, headers: { get() { return null; } } };
+      },
+      async testSource() {
+        await gate;
+        return { url: 'https://shop.test/collections/cards', products: 2, available: 2, unavailable: 0, unknown: 0 };
+      }
+    };
+
+    const pending = handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interactionWithToken({
+        data: linksData('testar', 'https://shop.test/collections/cards')
+      })),
+      x.env, DEFAULTS, validateSource, services
+    );
+
+    const res = await json(await pending);
+    deferredResolved = true;
+    assert.equal(res.body.type, 5);
+    assert.equal(res.body.data.flags, 64);
+    assert.equal(patches.length, 0);
+
+    release();
+    await Promise.all(background);
+
+    assert.equal(deferredResolved, true);
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].method, 'PATCH');
+    assert.match(patches[0].url, new RegExp(`/webhooks/${APP}/`));
+    assert.match(patches[0].url, /\/messages\/@original$/);
+    assert.equal(patches[0].redirect, 'error');
+    assert.match(patches[0].body.content, /disponíveis: 2/);
+    assert.deepEqual(patches[0].body.allowed_mentions, { parse: [] });
+    assert.equal(JSON.stringify(patches[0].headers || {}).includes(INTERACTION_TOKEN), false);
+  } finally { x.sql.close(); }
+});
+
+test('monitor command sequence persists settings and rejects invalid inputs', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  const userA = '111111111111111111';
+  const userB = '222222222222222222';
+  const botId = '333333333333333333';
+  try {
+    const services = {
+      settingsDefaults: SETTINGS_DEFAULTS,
+      async getStatus() {
+        const settings = await getMonitorSettings(x.env, SETTINGS_DEFAULTS);
+        return { enabled: settings.enabled, settings, configured: DEFAULTS, sources: {}, pending: 0 };
+      },
+      async sendTest() { return { status: 'test sent' }; }
+    };
+
+    let res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('iniciar') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Monitor iniciado/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).enabled, true);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('pausar') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Monitor pausado/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).enabled, false);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('estado') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /pausado/);
+    assert.match(res.body.data.content, /PokeBot/);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('testar') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Notificação de teste enviada/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).enabled, false);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: {
+          ...monitorData('marcar', [{ name: 'usuario', type: 6, value: userA }]),
+          resolved: { users: { [userA]: { id: userA, bot: false, username: 'a' } } }
+        }
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, new RegExp(`<@${userA}>`));
+    assert.deepEqual(res.body.data.allowed_mentions, { parse: [] });
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: {
+          ...monitorData('marcar', [{ name: 'usuario', type: 6, value: userA }]),
+          resolved: { users: { [userA]: { id: userA, bot: false } } }
+        }
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /já estava/);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: {
+          ...monitorData('marcar', [{ name: 'usuario', type: 6, value: botId }]),
+          resolved: { users: { [botId]: { id: botId, bot: true } } }
+        }
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /bots/);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('marcar', [{ name: 'usuario', type: 6, value: '123' }])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /ID de utilizador inválido/);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: {
+          ...monitorData('marcar', [{ name: 'usuario', type: 6, value: userB }]),
+          resolved: { users: { [userB]: { id: userB, bot: false } } }
+        }
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /marcado/);
+
+    let settings = await getMonitorSettings(x.env, SETTINGS_DEFAULTS);
+    assert.ok(settings.mentionUserIds.includes('207557157858574337'));
+    assert.ok(settings.mentionUserIds.includes(userA));
+    assert.ok(settings.mentionUserIds.includes(userB));
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('mencoes') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, new RegExp(`<@${userA}>`));
+    assert.deepEqual(res.body.data.allowed_mentions, { parse: [] });
+
+    for (const id of [...settings.mentionUserIds]) {
+      res = await json(await handleLinksInteraction(
+        await signedRequest(keyPair.privateKey, interaction({
+          data: monitorData('desmarcar', [{ name: 'usuario', type: 6, value: id }])
+        })),
+        x.env, DEFAULTS, validateSource, services
+      ));
+      assert.match(res.body.data.content, /desmarcado/);
+    }
+    settings = await getMonitorSettings(x.env, SETTINGS_DEFAULTS);
+    assert.deepEqual(settings.mentionUserIds, []);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('desmarcar', [{ name: 'usuario', type: 6, value: userA }])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /não estava/);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('mensagem') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Modelo atual/);
+    assert.match(res.body.data.content, /\{mencoes\}/);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('mensagem', [{ name: 'texto', type: 3, value: '{tipo} {produto} {url}' }])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /atualizado/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).messageTemplate, '{tipo} {produto} {url}');
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('mensagem', [{ name: 'texto', type: 3, value: '{nope}' }])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Modelo de mensagem inválido/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).messageTemplate, '{tipo} {produto} {url}');
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('repor_mensagem') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /reposto/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).messageTemplate, '{mencoes}');
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('configurar', [
+          { name: 'opcao', type: 3, value: 'alertOnSoldOutListings' },
+          { name: 'valor', type: 3, value: 'true' }
+        ])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Opção atualizada/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).alertOnSoldOutListings, true);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('configurar', [
+          { name: 'opcao', type: 3, value: 'includeKeywords' },
+          { name: 'valor', type: 3, value: 'charizard, pikachu' }
+        ])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.deepEqual((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).includeKeywords, ['charizard', 'pikachu']);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('configurar', [
+          { name: 'opcao', type: 3, value: 'includeKeywords' },
+          { name: 'valor', type: 3, value: 'limpar' }
+        ])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.deepEqual((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).includeKeywords, []);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('configurar', [
+          { name: 'opcao', type: 3, value: 'checkIntervalSeconds' },
+          { name: 'valor', type: 3, value: '120' }
+        ])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).checkIntervalSeconds, 120);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('configurar', [
+          { name: 'opcao', type: 3, value: 'enabled' },
+          { name: 'valor', type: 3, value: 'true' }
+        ])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Opção de configuração desconhecida|Não foi possível processar/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).enabled, false);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: monitorData('configurar', [
+          { name: 'opcao', type: 3, value: 'alertOnNewProducts' },
+          { name: 'valor', type: 3, value: 'yes' }
+        ])
+      })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Valor de configuração inválido/);
+
+    res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({
+        data: linksData('testar', 'https://shop.test/collections/cards')
+      })),
+      x.env, DEFAULTS, validateSource, {
+        settingsDefaults: SETTINGS_DEFAULTS,
+        async testSource(rawUrl) {
+          return { url: validateSource(rawUrl), products: 1, available: 1, unavailable: 0, unknown: 0 };
+        }
+      }
+    ));
+    assert.match(res.body.data.content, /só leitura/);
+    assert.equal((await getMonitorSettings(x.env, SETTINGS_DEFAULTS)).enabled, false);
+    assert.equal(x.sql.prepare('SELECT COUNT(*) AS n FROM source_config').get().n, 0);
+  } finally { x.sql.close(); }
+});
+
+test('monitor estado surfaces healthy baseline and blocked sources', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  const healthyUrl = 'https://shop.test/collections/cards';
+  const blockedUrl = 'https://blocked.test/collections/pokemon';
+  try {
+    const services = {
+      settingsDefaults: SETTINGS_DEFAULTS,
+      async getStatus() {
+        return {
+          enabled: true,
+          pending: 1,
+          lastError: null,
+          configured: [healthyUrl, blockedUrl],
+          sources: {
+            [healthyUrl]: {
+              initialized: true,
+              productCount: 5,
+              blocked: false,
+              lastError: null,
+              lastCheck: Date.parse('2026-09-07T10:00:00.000Z')
+            },
+            [blockedUrl]: {
+              initialized: true,
+              productCount: 0,
+              blocked: true,
+              lastError: 'Store HTTP 403',
+              lastCheck: Date.parse('2026-09-07T09:00:00.000Z'),
+              nextCheck: Date.parse('2026-09-07T11:00:00.000Z')
+            }
+          },
+          settings: await getMonitorSettings(x.env, SETTINGS_DEFAULTS)
+        };
+      }
+    };
+
+    const res = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('estado') })),
+      x.env, DEFAULTS, validateSource, services
+    ));
+    assert.match(res.body.data.content, /Monitor: ativo/);
+    assert.match(res.body.data.content, /Fontes configuradas: 2/);
+    assert.match(res.body.data.content, /shop\.test\/collections\/cards — ok/);
+    assert.match(res.body.data.content, /produtos=5/);
+    assert.match(res.body.data.content, /bloqueada/);
+    assert.match(res.body.data.content, /Store HTTP 403/);
+    assert.equal(res.body.data.content.includes('SECRET'), false);
+    assert.deepEqual(res.body.data.allowed_mentions, { parse: [] });
+  } finally { x.sql.close(); }
+});
+
+test('followup 429 long delay skips retry; short delay retries within budget', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    const longCalls = [];
+    const longBackground = [];
+    const { result: longResult, logs: longLogs } = await withCapturedLogs(async () => {
+      const services = {
+        settingsDefaults: SETTINGS_DEFAULTS,
+        waitUntil(promise) { longBackground.push(promise); },
+        async fetcher(url, init) {
+          longCalls.push({ url, init, at: Date.now() });
+          return {
+            ok: false,
+            status: 429,
+            headers: { get(name) { return name === 'Retry-After' ? '10' : null; } },
+            async arrayBuffer() { return new ArrayBuffer(0); }
+          };
+        },
+        async testSource() {
+          return { url: 'https://shop.test/collections/cards', products: 1, available: 1, unavailable: 0, unknown: 0 };
+        }
+      };
+      const started = Date.now();
+      const res = await handleLinksInteraction(
+        await signedRequest(keyPair.privateKey, interactionWithToken({
+          data: linksData('testar', 'https://shop.test/collections/cards')
+        })),
+        x.env, DEFAULTS, validateSource, services
+      );
+      await Promise.all(longBackground);
+      return { res, elapsed: Date.now() - started };
+    });
+
+    assert.equal((await longResult.res.json()).type, 5);
+    assert.equal(longCalls.length, 1);
+    assert.ok(longResult.elapsed < 2000, `elapsed ${longResult.elapsed}`);
+    const followups = longLogs
+      .flatMap(e => e.args)
+      .map(a => { try { return JSON.parse(a); } catch { return null; } })
+      .filter(Boolean)
+      .filter(r => r.event === 'discord_followup');
+    assert.ok(followups.some(r => r.reason === 'patch_failed' && r.http_status === 429));
+    assert.equal(JSON.stringify(longLogs).includes(INTERACTION_TOKEN), false);
+
+    const shortCalls = [];
+    const shortBackground = [];
+    const servicesShort = {
+      settingsDefaults: SETTINGS_DEFAULTS,
+      waitUntil(promise) { shortBackground.push(promise); },
+      async fetcher(url, init) {
+        shortCalls.push(Date.now());
+        if (shortCalls.length === 1) {
+          return {
+            ok: false,
+            status: 429,
+            headers: { get(name) { return name === 'Retry-After' ? '0' : null; } },
+            async arrayBuffer() { return new ArrayBuffer(0); }
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: { get() { return null; } },
+          async arrayBuffer() { return new ArrayBuffer(0); }
+        };
+      },
+      async testSource() {
+        return { url: 'https://shop.test/collections/cards', products: 1, available: 1, unavailable: 0, unknown: 0 };
+      }
+    };
+    const shortRes = await json(await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interactionWithToken({
+        data: linksData('testar', 'https://shop.test/collections/cards')
+      })),
+      x.env, DEFAULTS, validateSource, servicesShort
+    ));
+    await Promise.all(shortBackground);
+    assert.equal(shortRes.body.type, 5);
+    assert.equal(shortCalls.length, 2);
+  } finally { x.sql.close(); }
+});
+
+test('malformed monitor mutation options do not mutate settings', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  const userA = '111111111111111111';
+  try {
+    const services = { settingsDefaults: SETTINGS_DEFAULTS };
+    await handleLinksInteraction(
+      await signedRequest(keyPair.privateKey, interaction({ data: monitorData('iniciar') })),
+      x.env, DEFAULTS, validateSource, services
+    );
+    const before = await getMonitorSettings(x.env, SETTINGS_DEFAULTS);
+
+    const badCases = [
+      monitorData('marcar', [
+        { name: 'usuario', type: 6, value: userA },
+        { name: 'extra', type: 3, value: 'x' }
+      ]),
+      monitorData('marcar', [
+        { name: 'usuario', type: 6, value: userA },
+        { name: 'usuario', type: 6, value: userA }
+      ]),
+      monitorData('marcar', [{ name: 'usuario', type: 3, value: userA }]),
+      monitorData('desmarcar', []),
+      monitorData('configurar', [{ name: 'opcao', type: 3, value: 'alertOnNewProducts' }]),
+      monitorData('configurar', [
+        { name: 'opcao', type: 3, value: 'alertOnNewProducts' },
+        { name: 'valor', type: 3, value: 'true' },
+        { name: 'extra', type: 3, value: 'nope' }
+      ]),
+      monitorData('configurar', [
+        { name: 'opcao', type: 3, value: 'alertOnNewProducts' },
+        { name: 'valor', type: 6, value: userA }
+      ]),
+      monitorData('mensagem', [
+        { name: 'texto', type: 3, value: '{tipo}' },
+        { name: 'extra', type: 3, value: 'x' }
+      ]),
+      monitorData('mensagem', [{ name: 'texto', type: 6, value: userA }])
+    ];
+
+    for (const data of badCases) {
+      const res = await json(await handleLinksInteraction(
+        await signedRequest(keyPair.privateKey, interaction({
+          data: {
+            ...data,
+            resolved: { users: { [userA]: { id: userA, bot: false } } }
+          }
+        })),
+        x.env, DEFAULTS, validateSource, services
+      ));
+      assert.match(res.body.data.content, /Não foi possível processar o pedido/);
+      assert.deepEqual(await getMonitorSettings(x.env, SETTINGS_DEFAULTS), before);
+    }
+  } finally { x.sql.close(); }
 });

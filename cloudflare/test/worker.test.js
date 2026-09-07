@@ -2,8 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
-import worker, { runCheck, configuredCheck, changesFor, retrySeconds, sourcesFor, shopifyProducts, continenteProduct, continenteSearchPage } from '../src/worker.js';
+import worker, {
+  runCheck, configuredCheck, changesFor, retrySeconds, sourcesFor, shopifyProducts, continenteProduct, continenteSearchPage,
+  sendDiscord, testSourceUrl, sendTestNotification, getMonitorStatus
+} from '../src/worker.js';
 const config = { enabled: true, alertOnNewProducts: true, alertOnRestocks: true, alertOnSoldOutListings: true, includeKeywords: [], excludeKeywords: [] };
+const bundled = JSON.parse(readFileSync(new URL('../config.json', import.meta.url), 'utf8'));
 function setup() {
   const sql = new DatabaseSync(':memory:');
   sql.exec(readFileSync(new URL('../schema.sql', import.meta.url), 'utf8'));
@@ -333,7 +337,8 @@ test('persisted source_config overrides defaults for check and status; added sou
     const body = await status.json();
     assert.deepEqual(body.configured, [shop]);
     assert.ok(body.sources[shop]);
-    assert.equal(body.enabled, false);
+    assert.equal(body.enabled, true);
+    assert.equal(body.settings.enabled, true);
     x.persistSources([]);
     x.due();
     fetched = [];
@@ -346,10 +351,14 @@ test('persisted source_config overrides defaults for check and status; added sou
 test('removing persisted default stays empty; paused check skips work but interactions stay reachable', async () => {
   const x = setup();
   try {
+    const { updateMonitorSettings } = await import('../src/monitor-settings.js');
+    const bundled = JSON.parse(readFileSync(new URL('../config.json', import.meta.url), 'utf8'));
     x.persistSources([]);
     let fetches = 0;
-    assert.equal((await configuredCheck(x.env, { ...config, enabled: false }, async () => { fetches++; return new Response('no'); })).status, 'paused');
+    await updateMonitorSettings(x.env, bundled, current => ({ ...current, enabled: false }));
+    assert.equal((await configuredCheck(x.env, config, async () => { fetches++; return new Response('no'); })).status, 'paused');
     assert.equal(fetches, 0);
+    await updateMonitorSettings(x.env, bundled, current => ({ ...current, enabled: true }));
     assert.equal((await configuredCheck(x.env, config, async () => { fetches++; return new Response('no'); })).status, 'no_sources');
     assert.equal(fetches, 0);
     const unauthorized = await worker.fetch(new Request('https://example.test/check', { method: 'POST' }), x.env);
@@ -357,5 +366,167 @@ test('removing persisted default stays empty; paused check skips work but intera
     const interactions = await worker.fetch(new Request('https://example.test/interactions', { method: 'POST', body: '{}' }), x.env);
     assert.equal(interactions.status, 401);
     assert.notEqual(interactions.status, 404);
+  } finally { x.sql.close(); }
+});
+
+test('health and configuredCheck honor runtime enabled; health stays free of user ids', async () => {
+  const x = setup();
+  try {
+    const { updateMonitorSettings } = await import('../src/monitor-settings.js');
+    const health = await worker.fetch(new Request('https://example.test/health'), x.env);
+    assert.equal(health.status, 200);
+    const healthy = await health.json();
+    assert.equal(healthy.enabled, true);
+    assert.equal(healthy.service, 'geekhaven-monitor');
+    assert.equal('settings' in healthy, false);
+    assert.equal(JSON.stringify(healthy).includes('207557157858574337'), false);
+    await updateMonitorSettings(x.env, bundled, current => ({ ...current, enabled: false }));
+    const pausedHealth = await (await worker.fetch(new Request('https://example.test/health'), x.env)).json();
+    assert.equal(pausedHealth.enabled, false);
+    x.persistSources(['https://shop.test/collections/cards']);
+    assert.equal((await configuredCheck(x.env, config, async () => new Response('no'))).status, 'paused');
+  } finally { x.sql.close(); }
+});
+
+test('runtime filters, interval and notification config apply on configuredCheck send path', async () => {
+  const x = setup();
+  try {
+    const { updateMonitorSettings } = await import('../src/monitor-settings.js');
+    x.persistSources(['https://shop.test/collections/cards']);
+    let products = [product(1, false)];
+    const posts = [];
+    const fakeFetch = async (url, options = {}) => {
+      if (String(url).startsWith('https://discord.com')) {
+        assert.equal(options.redirect, 'error');
+        posts.push(JSON.parse(options.body));
+        return Response.json({});
+      }
+      return Response.json({ products });
+    };
+    await configuredCheck(x.env, config, fakeFetch);
+    await updateMonitorSettings(x.env, bundled, current => ({
+      ...current,
+      includeKeywords: ['special'],
+      checkIntervalSeconds: 120,
+      mentionUserIds: ['207557157858574337'],
+      messageTemplate: '{mencoes} {tipo} {produto}',
+      webhookUsername: 'PokeBot'
+    }));
+    x.due();
+    products = [product(1, true), { id: 2, title: 'Special Booster', handle: 'special-booster', variants: [{ available: true }] }];
+    const result = await configuredCheck(x.env, config, fakeFetch);
+    assert.equal(result.sent, 1);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].username, 'PokeBot');
+    assert.match(posts[0].content, /<@207557157858574337>/);
+    assert.match(posts[0].content, /RESTOCK|NEW PRODUCT/);
+    assert.deepEqual(posts[0].allowed_mentions, {
+      parse: [],
+      users: ['207557157858574337'],
+      roles: [],
+      replied_user: false
+    });
+    assert.equal(posts[0].embeds[0].title.startsWith('NEW PRODUCT:') || posts[0].embeds[0].title.startsWith('RESTOCK:'), true);
+    const next = x.state().sources['https://shop.test/collections/cards'].nextCheck;
+    assert.ok(next > Date.now() + 100000);
+  } finally { x.sql.close(); }
+});
+
+test('sendDiscord keeps TEST embed truthful and blocks everyone parsing from product text', async () => {
+  const posts = [];
+  const fetcher = async (url, options = {}) => {
+    assert.equal(options.redirect, 'error');
+    posts.push(JSON.parse(options.body));
+    return Response.json({});
+  };
+  const notification = {
+    enabled: true,
+    alertOnNewProducts: true,
+    alertOnRestocks: true,
+    alertOnSoldOutListings: false,
+    includeKeywords: [],
+    excludeKeywords: [],
+    checkIntervalSeconds: 60,
+    mentionUserIds: ['207557157858574337'],
+    messageTemplate: '{produto}',
+    webhookUsername: 'PokeBot'
+  };
+  await sendDiscord({ DISCORD_WEBHOOK_URL: 'https://discord.com/api/webhooks/123/fake' }, {
+    kind: 'TEST',
+    title: 'Drop @everyone @here',
+    available: true,
+    url: 'https://geekhaven.pt/collections/pokemon'
+  }, fetcher, notification);
+  assert.match(posts[0].content, /^TEST\b/);
+  assert.match(posts[0].embeds[0].title, /^TEST:/);
+  assert.deepEqual(posts[0].allowed_mentions.parse, []);
+  assert.deepEqual(posts[0].allowed_mentions.roles, []);
+  assert.equal(posts[0].allowed_mentions.replied_user, false);
+  assert.deepEqual(posts[0].allowed_mentions.users, ['207557157858574337']);
+});
+
+test('testSourceUrl is live read-only and does not mutate history while paused', async () => {
+  const x = setup();
+  try {
+    const { updateMonitorSettings } = await import('../src/monitor-settings.js');
+    await updateMonitorSettings(x.env, bundled, current => ({ ...current, enabled: false }));
+    await runCheck(x.env, { ...config, enabled: false, sources: ['https://shop.test/collections/cards'] }, async () => Response.json({ products: [product(1, true)] }));
+    assert.equal(x.state().sources, undefined);
+    let fetches = 0;
+    const result = await testSourceUrl('https://shop.test/collections/cards', async () => {
+      fetches++;
+      return Response.json({ products: [product(1, true), product(2, false)] });
+    });
+    assert.equal(fetches, 1);
+    assert.equal(result.url, 'https://shop.test/collections/cards');
+    assert.equal(result.products, 2);
+    assert.equal(result.available, 1);
+    assert.equal(result.unavailable, 1);
+    assert.equal(result.unknown, 0);
+    assert.equal(x.state().sources, undefined);
+    await assert.rejects(() => testSourceUrl('https://evil.example/search'), /Invalid config/);
+    await assert.rejects(() => testSourceUrl('http://shop.test/products/card'), /Invalid config/);
+  } finally { x.sql.close(); }
+});
+
+test('admin /test uses runtime notification settings while paused and maps Discord 429', async () => {
+  const x = setup();
+  try {
+    const { updateMonitorSettings } = await import('../src/monitor-settings.js');
+    await updateMonitorSettings(x.env, bundled, current => ({
+      ...current,
+      enabled: false,
+      messageTemplate: '{mencoes} {tipo}',
+      webhookUsername: 'PokeBot'
+    }));
+    const posts = [];
+    const prior = x.state();
+    const direct = await sendTestNotification(x.env, bundled, async (_url, options = {}) => {
+      posts.push(JSON.parse(options.body));
+      return Response.json({});
+    });
+    assert.equal(direct.status, 'test sent');
+    assert.match(posts[0].content, /TEST/);
+    assert.match(posts[0].embeds[0].title, /^TEST:/);
+    assert.equal(posts[0].username, 'PokeBot');
+    assert.deepEqual(x.state(), prior);
+    const status = await getMonitorStatus(x.env);
+    assert.equal(status.enabled, false);
+    assert.equal(status.settings.enabled, false);
+    assert.ok(Array.isArray(status.configured));
+    await assert.rejects(() => sendTestNotification(x.env, bundled, async () => {
+      return Response.json({ retry_after: 1 }, { status: 429 });
+    }), /Discord HTTP 429/);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => Response.json({ retry_after: 1 }, { status: 429 });
+    try {
+      const route429 = await worker.fetch(new Request('https://example.test/test', { method: 'POST', headers: { Authorization: 'Bearer test' } }), x.env);
+      assert.equal(route429.status, 429);
+      const body = await route429.json();
+      assert.equal(body.error, 'Rate limited');
+      assert.equal(JSON.stringify(body).includes('discord.com/api/webhooks'), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   } finally { x.sql.close(); }
 });

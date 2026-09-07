@@ -1,6 +1,6 @@
 # Upgrade an existing Cloudflare Worker
 
-Use this when FazGuita’s Worker is **already deployed** and you want the multi-store / Discord `/links` code without creating a new Worker or D1 database. For a first-time install, use [SETUP.md](SETUP.md) instead.
+Use this when FazGuita’s Worker is **already deployed** and you want the multi-store / Discord `/links` `/monitor` `/ajuda` / D1 settings code without creating a new Worker or D1 database. For a first-time install, use [SETUP.md](SETUP.md) instead.
 
 PowerShell examples below. On macOS/Linux/bash, replace `npm.cmd` / `npx.cmd` with `npm` / `npx` and use equivalent shell syntax.
 
@@ -65,30 +65,35 @@ npx.cmd wrangler d1 export geekhaven-monitor --remote --output=$backupPath
 
 Use your real database **name** if it differs. If CLI export is unavailable in your environment, use the Cloudflare dashboard D1 [Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/) / recovery guidance for that database instead — do not invent alternate export commands.
 
-Apply the rerunnable schema. This creates the `source_config` **table** if missing and leaves `monitor` (and any existing `source_config` **row**) intact (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE` for the monitor singleton):
+Apply the rerunnable schema. This creates `source_config` and `monitor_settings` **tables** if missing and leaves `monitor` (and any existing config **rows**) intact (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE` for the monitor singleton):
 
 ```powershell
 npx.cmd wrangler d1 execute geekhaven-monitor --remote --file=.\schema.sql
 ```
 
-**Migration order: schema first, then deploy.** If `main` is connected to an auto-deploy pipeline, applying schema before that pipeline publishes code avoids a window where new routes expect the `source_config` table but it is missing. A git push alone is not a Worker deploy unless that connection exists.
+**No separate manual migration is required for the settings feature** on an existing schema that already has `monitor` / `source_config`: `monitor_settings` is also auto-created non-destructively on first settings use. Fresh setups still apply the full schema. Prefer applying `schema.sql` once before deploy so tables exist ahead of code that expects them.
 
-## 6. Source list behavior after upgrade
+**Migration order: schema first, then deploy.** If `main` is connected to an auto-deploy pipeline, applying schema before that pipeline publishes code avoids a window where new routes expect tables that are missing. A git push alone is not a Worker deploy unless that connection exists.
+
+## 6. Source list and runtime settings after upgrade
 
 - The `source_config` **table** must exist (step 5). Fallback applies only when the singleton **row** is absent: `getSources` then returns the **two** bundled `config.json` sources.
 - `/links listar` does **not** insert a config row.
 - After the **first** add/remove mutation, D1 `source_config` is authoritative — including an empty list (`no_sources` until you add URLs again).
-- First genuinely new sources baseline silently; existing per-source history is reused when a URL is re-added.
+- First genuinely new sources baseline silently; existing per-source history is reused when a URL is re-added. Failed PDP parsing stays fail-closed; caps unchanged.
+- Runtime settings (enablement, alert toggles, keywords, interval, webhook username, mentions, template) persist in D1 singleton `monitor_settings`. D1 values override bundled defaults and survive redeploy. Sources keep existing `source_config` semantics.
+- Settings take effect on the **next** operation/check. An already-running scan or send may finish with the settings it loaded — there is no instantaneous cancel or mid-fetch config swap. Pending alerts use **current notification settings** (mentions/template) for their delivery run, not a snapshot stored at detection. Filters that already queued an alert are not re-evaluated retroactively.
+- Default mention list is `['207557157858574337']`. Removing it persists and is not re-added on deploy; new bundled defaults do not override saved settings.
 
 ## 7. Config flags and Discord runtime keys only
 
-Upstream ships `"enabled": false`. A blind deploy therefore **pauses** monitoring until you set `"enabled": true` in `cloudflare/config.json` and redeploy. To keep running through the upgrade, set `enabled` to `true` before deploy; to pause while testing slash commands, leave it `false`.
+Bundled `cloudflare/config.json` ships `"enabled": true` for this authorized deployment (root Windows config untouched). After upgrade, prefer `/monitor iniciar` / `/monitor pausar` for effective enablement so the choice is stored in D1 and survives later redeploys of the bundled file. A blind deploy of code alone does not wipe saved D1 settings.
 
-Preserve existing `DISCORD_WEBHOOK_URL` and `ADMIN_TOKEN`. Do not rotate them unless compromised.
+Preserve existing `DISCORD_WEBHOOK_URL` and `ADMIN_TOKEN`. Do not rotate them unless compromised. Runtime-only Worker keys remain: public key, application id, guild id, webhook, admin — unchanged. Bot token stays local for registration only (never Worker/git/chat).
 
 ### Discord app values (needed before `secret put`)
 
-Create or reuse a Discord application ([Developer Portal](https://discord.com/developers/applications); fuller UI walkthrough in [SETUP.md §8](SETUP.md#8-discord-slash-commands-for-source-urls)):
+Create or reuse a Discord application ([Developer Portal](https://discord.com/developers/applications); fuller UI walkthrough in [SETUP.md §8](SETUP.md#8-discord-slash-commands)):
 
 1. **Application ID** — General Information (digits only) → becomes `DISCORD_APPLICATION_ID`
 2. **Public Key** — General Information (hex) → becomes `DISCORD_PUBLIC_KEY`
@@ -112,7 +117,7 @@ CLI (recommended — uploads the multi-file Worker, imported JSON, and modules; 
 npx.cmd wrangler deploy
 ```
 
-That updates the **existing** Worker named in `wrangler.jsonc`, keeps the same `workers.dev` route when unchanged, and retains the cron trigger from config. `POST /interactions` must exist on this deploy before Discord can validate the endpoint in step 9.
+That updates the **existing** Worker named in `wrangler.jsonc`, keeps the same `workers.dev` route when unchanged, and retains the cron trigger from config. `POST /interactions` must exist on this deploy before Discord can validate the endpoint in step 9. Interaction handlers defer ack and edit the private original response so long store fetches work without the 3s failure window.
 
 Dashboard users: **Workers & Pages** → existing Worker → create/upload a **version** that includes the full build (CLI `wrangler deploy` is the supported path). Under **Settings → Bindings**, confirm D1 binding **`DB`**. Under **Variables and Secrets**, confirm webhook, admin, and Discord keys. Do not replace the Worker with a newly created empty one.
 
@@ -120,7 +125,7 @@ Dashboard users: **Workers & Pages** → existing Worker → create/upload a **v
 
 1. In the Discord developer portal, set **Interactions Endpoint URL** to `https://YOUR-WORKER.workers.dev/interactions` (your real Worker URL). Discord validates immediately with a signed PING; the Worker from step 8 must already verify signatures.
 
-2. Register the guild `/links` command. Dry-run needs only application and guild IDs (no bot token). `--apply` needs the bot token in the **local** environment only:
+2. Register the three guild commands. Dry-run needs only application and guild IDs (no bot token). `--apply` needs the bot token in the **local** environment only. The script **POSTs upserts for `/links`, `/monitor`, and `/ajuda` individually** — it does not bulk-replace unrelated guild commands:
 
 ```powershell
 $env:DISCORD_APPLICATION_ID = 'YOUR_APPLICATION_ID'
@@ -137,7 +142,9 @@ try {
 }
 ```
 
-Do not paste the bot token into command history or source files. Never upload `DISCORD_BOT_TOKEN` as a Worker secret.
+You can run the script with Node 22 directly (`node scripts/register-commands.mjs`). `npm install` is not strictly required for registration alone; deps remain needed for tests/deploy. Do not paste the bot token into command history or source files. Never upload `DISCORD_BOT_TOKEN` as a Worker secret.
+
+**Existing installs must rerun registration once** after this code upgrade (new `/monitor` and `/ajuda`, expanded `/links`). Do not rerun on every settings/config change.
 
 ## 10. Verify
 
@@ -159,10 +166,11 @@ try {
 
 Confirm:
 
-- `/health` responds; `enabled` matches bundled config
-- `/status` shows nested `sources` history, `configured` list, and preserved `pending` when applicable
-- Discord: `/links listar`, `/links adicionar url:…`, `/links remover url:…` (Manage Guild or Administrator; ephemeral replies). Example: `/links adicionar url:https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01`
-- Optional webhook check — **sends a real TEST message** to Discord (reuse the same secure prompt pattern for `$headers` if the previous `try` block ended):
+- `/health` responds; `enabled` is the **effective** value (D1 override when present)
+- `/status` shows nested `sources` history, `configured` list, dynamic settings, and preserved `pending` when applicable
+- Discord (Manage Guild / Administrator; ephemeral private replies): `/links listar`, `/links testar url:…`, `/links adicionar`, `/links remover`, `/monitor testar`, `/monitor iniciar`, `/monitor estado`, `/ajuda`. Example: `/links adicionar url:https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01`
+- Suggested sequence: list/test a supported source → `/monitor testar` receives a real labelled **TEST** with tags → `/monitor iniciar` → `/monitor estado` shows per-source baseline / product count / last scan / errors. Follow-up edit budget 8s; `/links testar` source budget 20s. These do not prove checkout stock or phone delivery.
+- Optional admin webhook check — **sends a real TEST message** to Discord (reuse the same secure prompt pattern for `$headers` if the previous `try` block ended):
 
 ```powershell
 $secureAdmin = Read-Host -AsSecureString 'Existing ADMIN_TOKEN'
@@ -176,15 +184,15 @@ try {
 }
 ```
 
-Notifications never guarantee stock still exists when you click.
+Notifications never guarantee stock still exists when you click. Full command table, template placeholders, and config keys: [SETUP.md §7–8](SETUP.md#7-change-filters-mentions-template-or-pause).
 
 ## Connect the existing Worker to GitHub
 
 Optional. Use this when you want pushes to update the **same** already-deployed Worker. Official docs: [Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/), [build configuration](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/).
 
-1. **Schema first (manual).** Apply `schema.sql` to the existing D1 database (step 5) **before** the first automated production deploy. Auto-deploy does not run schema for you.
+1. **Schema first (manual).** Apply `schema.sql` to the existing D1 database (step 5) **before** the first automated production deploy. Auto-deploy does not run schema for you. (`monitor_settings` can also auto-create on first use, but prefer schema-first.)
 2. **Committed `wrangler.jsonc` must match production.** GitHub Builds uses the **committed** file in the repo root directory — not a local-only edit and not dashboard-only bindings. Before enabling Builds, ensure the committed config’s Worker `name` matches the existing Worker and that `database_id` is **your** real existing D1 UUID (preserve the binding you already run; do not swap in another account’s committed ID). The D1 UUID is an identifier, not an auth secret; commit it only if your privacy policy allows. Do not invent unimplemented “generate config from build vars” support here. Secrets never go in git.
-3. **`enabled` is intentional.** Upstream `cloudflare/config.json` ships `"enabled": false`. A CI deploy of that file pauses monitoring until you commit `true` (or keep deploying paused on purpose).
+3. **`enabled` and D1 settings.** Bundled `cloudflare/config.json` ships `"enabled": true` for this authorized deployment. Saved D1 `monitor_settings` override bundled defaults after the first settings write and survive CI redeploys. New installs should still set `false` before first deploy until secrets/schema are ready (see SETUP). Prefer Discord `/monitor` for day-to-day pause/start so the choice persists in D1.
 4. **Connect Builds to the existing Worker** ([connect an existing Worker](https://developers.cloudflare.com/workers/ci-cd/builds/#connect-an-existing-worker)): Cloudflare dashboard → **Workers & Pages** → **your existing Worker** (not Create Pages / not a new Worker) → **Settings** → **Builds** → **Connect**. Authorize GitHub for **only** the `SillyDevz/FazGuita` repository.
 5. **Build settings** ([configuration](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)):
    - Production branch: `main`
@@ -194,10 +202,11 @@ Optional. Use this when you want pushes to update the **same** already-deployed 
    - Build variable: `NODE_VERSION` = `22` (official build-image support; npm deps install automatically from `package.json`)
 6. **Runtime secrets stay in the dashboard.** Under the same Worker → **Settings** → **Variables and Secrets**, keep these five runtime keys: `DISCORD_WEBHOOK_URL`, `ADMIN_TOKEN`, `DISCORD_PUBLIC_KEY`, `DISCORD_APPLICATION_ID`, `DISCORD_GUILD_ID`. Never put `DISCORD_BOT_TOKEN` on the Worker (registration-only, local). Build variables are not Worker runtime secrets.
 
-Enabling Builds is a deliberate dashboard action. This guide does not run CI or deploy for you. After connect, a push to `main` can deploy before you finish schema or `enabled` — finish steps 1–3 first.
+Enabling Builds is a deliberate dashboard action. This guide does not run CI or deploy for you. After connect, a push to `main` can deploy before you finish schema — finish steps 1–2 first. Rerun command registration once after the upgrade deploy if `/monitor` / `/ajuda` are not yet registered.
 
 ## Reminders
 
 - Commit/push updates git; they are not a manual deploy unless Builds (above) is connected.
 - Connected `main` auto-pipelines can deploy before you finish schema — apply schema first.
+- Sources, filters, tags, message, and settings apply without redeploy; secrets/cron/caps do not.
 - Free CPU/subrequest limits still apply; reduce Continente scope or use an explicitly approved paid plan if metrics demand it. This upgrade does not change billing by itself.
