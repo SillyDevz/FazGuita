@@ -22,27 +22,153 @@ const SAFE_STATUS_ERRORS = new Set([
 
 export function helpContent() {
   const text = [
-    'Comandos (Manage Guild / Administrador; respostas efémeras, sem pings):',
+    'Ajuda do monitor de stock.',
     '',
-    '/links adicionar url:<url>',
-    '/links listar',
-    '/links remover url:<url>',
-    '/links testar url:<url> — só leitura: não adiciona fonte, não altera histórico nem envia alertas.',
+    'Começa rápido: vê o que já existe com `/links listar`, adiciona com `/links adicionar`, confirma com `/links testar`, escolhe quem recebe alertas e usa `/monitor iniciar`.',
     '',
-    '/monitor iniciar | pausar | estado | testar',
-    '/monitor marcar usuario:<user> | desmarcar usuario:<user> | mencoes',
-    '/monitor mensagem [texto:<modelo>] — sem texto mostra o modelo atual e placeholders.',
-    '/monitor repor_mensagem',
-    '/monitor configurar opcao:<campo> valor:<valor>',
-    '',
-    'Campos configurar: alertOnNewProducts, alertOnRestocks, alertOnSoldOutListings, includeKeywords, excludeKeywords, checkIntervalSeconds, webhookUsername.',
-    'Booleanos: true ou false. Palavras-chave: lista separada por vírgulas, ou limpar.',
-    `Placeholders: ${PLACEHOLDERS}`,
-    '/monitor testar envia notificação real rotulada (mesmo com monitor pausado).',
-    'Primeira passagem de fonte nova faz baseline silenciosa.',
-    'Menções: até 20 IDs de utilizador; sem cargos ou @everyone.'
+    'As respostas de definição são privadas. Precisas de «Gerir servidor» ou «Administrador». Os cartões abaixo detalham cada área.'
   ].join('\n');
   return text.length > MAX_CONTENT ? text.slice(0, MAX_CONTENT) : text;
+}
+
+export function helpEmbeds() {
+  return [
+    {
+      title: 'Começar e testar',
+      description: [
+        '**Fluxo simples**',
+        '1. Vê as fontes atuais com `/links listar` (evita duplicar pesquisas parecidas).',
+        '2. Adiciona uma URL HTTPS suportada, se ainda não existir.',
+        '3. Confirma a fonte com teste só de leitura.',
+        '4. Marca quem deve ser notificado.',
+        '5. Inicia o monitor.',
+        '',
+        '**Exemplo de link**',
+        '```',
+        'https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01',
+        '```',
+        '',
+        '`/links testar url:<url>` — abre a loja e verifica os produtos e o stock, sem adicionar o link, alterar o histórico ou enviar alertas.',
+        '',
+        '`/monitor testar` — envia uma notificação **real de teste (TEST)** no canal (usa as menções configuradas; funciona mesmo com o monitor pausado).',
+        '',
+        '`/monitor iniciar` — ativa o monitor.',
+        '`/monitor pausar` — pausa o monitor.',
+        '`/monitor estado` — mostra o estado e a configuração.',
+        '',
+        'Na primeira verificação de uma fonte nova, o stock atual fica registado em silêncio. Alertas de reposição ou produtos novos só aparecem depois.'
+      ].join('\n')
+    },
+    {
+      title: 'Gerir links',
+      description: [
+        '**Começa por listar** o que já está configurado:',
+        '',
+        '```',
+        '/links listar',
+        '```',
+        '',
+        'Depois adiciona, remove ou testa com a URL completa (mesmos parâmetros = mesma fonte):',
+        '',
+        '```',
+        '/links adicionar url:https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01',
+        '```',
+        '',
+        '```',
+        '/links remover url:https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01',
+        '```',
+        '',
+        '```',
+        '/links testar url:https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01',
+        '```',
+        '',
+        '`/links testar` abre a loja e verifica os produtos e o stock, sem adicionar o link nem enviar alertas. Para um aviso real no canal usa `/monitor testar`.'
+      ].join('\n')
+    },
+    {
+      title: 'Quem recebe menções',
+      description: [
+        'Escolhe pessoas reais no seletor de utilizadores do Discord. O texto `@amigo` abaixo é só **texto de exemplo** — escolhe o amigo certo, não escrevas esse texto.',
+        '',
+        '```',
+        '/monitor marcar usuario:@amigo',
+        '```',
+        '',
+        '```',
+        '/monitor desmarcar usuario:@amigo',
+        '```',
+        '',
+        '```',
+        '/monitor mencoes',
+        '```',
+        '',
+        'Só utilizadores (sem cargos). Sem menções gerais. Limite prático: até 20 pessoas.'
+      ].join('\n')
+    },
+    {
+      title: 'Mensagem personalizada',
+      description: [
+        '**Ver o modelo atual** (e a lista de campos):',
+        '',
+        '```',
+        '/monitor mensagem',
+        '```',
+        '',
+        '**Definir um modelo**',
+        '',
+        '```',
+        '/monitor mensagem texto:{mencoes} {tipo}: {produto} — {url}',
+        '```',
+        '',
+        '**Repor o modelo predefinido**',
+        '',
+        '```',
+        '/monitor repor_mensagem',
+        '```',
+        '',
+        '**Campos disponíveis**',
+        '- `{mencoes}` — quem deve ser mencionado (mantém isto se quiseres pings)',
+        '- `{tipo}` — tipo de alerta',
+        '- `{produto}` — nome do produto',
+        '- `{url}` — ligação do produto',
+        '- `{estado}` — estado do stock',
+        '- `{loja}` — loja / origem'
+      ].join('\n')
+    },
+    {
+      title: 'Configuração',
+      description: [
+        'Usa `/monitor configurar` e escolhe a opção pelo **rótulo do menu** (não precisas de escrever chaves técnicas).',
+        '',
+        '**Exemplos**',
+        '',
+        '```',
+        '/monitor configurar',
+        'opcao: Intervalo de verificação (segundos)',
+        'valor: 120',
+        '```',
+        '(~2 min. Entre 60 e 3600 segundos.)',
+        '',
+        '```',
+        '/monitor configurar',
+        'opcao: Palavras-chave de inclusão',
+        'valor: Booster Box, Elite Trainer',
+        '```',
+        'Escreve `limpar` no valor para apagar a lista de palavras-chave.',
+        '',
+        '```',
+        '/monitor configurar',
+        'opcao: Alertar reposições',
+        'valor: true',
+        '```',
+        '`true` = ligar, `false` = desligar.',
+        '',
+        'Outros rótulos do menu: «Alertar novos produtos», «Alertar listagens esgotadas» (por omissão desligado), «Palavras-chave de exclusão», «Nome do webhook».',
+        '',
+        'As respostas de definição ficam privadas. `/monitor testar` publica no canal real. Este comando não altera segredos de segurança.'
+      ].join('\n')
+    }
+  ];
 }
 
 function isUserSnowflake(id) {

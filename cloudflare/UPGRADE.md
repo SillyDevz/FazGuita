@@ -117,7 +117,7 @@ CLI (recommended — uploads the multi-file Worker, imported JSON, and modules; 
 npx.cmd wrangler deploy
 ```
 
-That updates the **existing** Worker named in `wrangler.jsonc`, keeps the same `workers.dev` route when unchanged, and retains the cron trigger from config. `POST /interactions` must exist on this deploy before Discord can validate the endpoint in step 9. Interaction handlers defer ack and edit the private original response so long store fetches work without the 3s failure window.
+That updates the **existing** Worker named in `wrangler.jsonc`, keeps the same `workers.dev` route when unchanged, and retains the cron trigger from config. `POST /interactions` must exist on this deploy before Discord can validate the endpoint in step 9. `/ajuda` always replies immediately (private); other fast commands normally return a complete private reply directly (bounded ~1.3s, defer only if slow); `/links testar` and `/monitor testar` still ack then edit the private original.
 
 Dashboard users: **Workers & Pages** → existing Worker → create/upload a **version** that includes the full build (CLI `wrangler deploy` is the supported path). Under **Settings → Bindings**, confirm D1 binding **`DB`**. Under **Variables and Secrets**, confirm webhook, admin, and Discord keys. Do not replace the Worker with a newly created empty one.
 

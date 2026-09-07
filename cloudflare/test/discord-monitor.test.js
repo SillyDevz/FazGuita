@@ -1,20 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { helpContent, formatStatus } from '../src/discord-monitor.js';
+import { helpContent, helpEmbeds, formatStatus } from '../src/discord-monitor.js';
 
 test('help content covers command syntax and stays ephemeral-sized', () => {
   const text = helpContent();
   assert.ok(text.length <= 2000);
-  assert.match(text, /\/links adicionar/);
   assert.match(text, /\/links testar/);
-  assert.match(text, /só leitura/);
-  assert.match(text, /\/monitor iniciar/);
-  assert.match(text, /\/monitor configurar/);
-  assert.match(text, /limpar/);
-  assert.match(text, /\{mencoes\}/);
-  assert.match(text, /\{produto\}/);
-  assert.match(text, /baseline silenciosa/);
-  assert.match(text, /mesmo com monitor pausado/);
+  assert.match(text, /\/monitor/);
+  assert.match(text, /Gerir servidor|Administrador/);
+
+  const embeds = helpEmbeds();
+  assert.equal(embeds.length, 5);
+  const blob = embeds.map(e => `${e.title}\n${e.description}`).join('\n');
+  assert.match(blob, /\/links adicionar/);
+  assert.match(blob, /\/links testar/);
+  assert.match(blob, /só de leitura|abre a loja e verifica os produtos e o stock/);
+  assert.match(blob, /\/monitor iniciar/);
+  assert.match(blob, /\/monitor pausar/);
+  assert.match(blob, /\/monitor configurar/);
+  assert.match(blob, /limpar/);
+  assert.match(blob, /\{mencoes\}/);
+  assert.match(blob, /\{produto\}/);
+  assert.match(blob, /silêncio/);
+  assert.match(blob, /pausado/);
 });
 
 test('formatStatus shows healthy baseline and blocked source without secrets', () => {

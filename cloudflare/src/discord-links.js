@@ -1,4 +1,4 @@
-import { handleMonitorSubcommand, helpContent } from './discord-monitor.js';
+import { handleMonitorSubcommand, helpContent, helpEmbeds } from './discord-monitor.js';
 
 const MAX_SOURCES = 20;
 const MAX_CONTENT = 2000;
@@ -321,6 +321,10 @@ function isValidApplicationSnowflake(id) {
 
 const FOLLOWUP_BUDGET_MS = 8000;
 const FOLLOWUP_RETRY_MAX_MS = 2000;
+const FOLLOWUP_MAX_ATTEMPTS = 3;
+const FAST_REPLY_BUDGET_MS = 1300;
+const ACK_MISS_CODES = new Set([10008, 10015]);
+const ACK_MISS_DELAYS_MS = [150, 300];
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -337,30 +341,57 @@ function parseRetryAfterMs(response) {
   return null;
 }
 
-function followupFail(reason, http_status) {
+function emitFollowup(level, fields) {
   const record = {
     event: FOLLOWUP_EVENT,
-    outcome: 'failure',
-    reason,
-    stage: 'followup'
+    stage: 'followup',
+    outcome: fields.outcome,
+    reason: fields.reason,
+    attempts: boundInt(fields.attempts, 10)
   };
-  if (http_status != null) record.http_status = boundInt(http_status, 599);
-  emitDiagnostic('warn', record);
+  if (typeof fields.diagnostic_id === 'string' && fields.diagnostic_id) {
+    record.diagnostic_id = fields.diagnostic_id;
+  }
+  if (fields.http_status != null) record.http_status = boundInt(fields.http_status, 599);
+  if (fields.discord_error_code != null) {
+    record.discord_error_code = boundInt(fields.discord_error_code, 1_000_000_000);
+  }
+  emitDiagnostic(level, record);
 }
 
-async function patchOriginalResponse(fetcher, applicationId, token, content) {
+async function parseSafeDiscordErrorCode(response) {
+  try {
+    const data = await response.json();
+    if (data && typeof data.code === 'number' && Number.isInteger(data.code) && data.code >= 0 && data.code <= 1_000_000_000) {
+      return data.code;
+    }
+  } catch {
+    try { await response.arrayBuffer(); } catch { /* ignore */ }
+  }
+  return null;
+}
+
+async function patchOriginalResponse(fetcher, applicationId, token, content, diagnostic_id) {
   const text = content.length > MAX_CONTENT ? content.slice(0, MAX_CONTENT) : content;
   const url = `https://discord.com/api/v10/webhooks/${encodeURIComponent(applicationId)}/${encodeURIComponent(token)}/messages/@original`;
   const body = JSON.stringify({ content: text, allowed_mentions: { parse: [] } });
   const deadline = Date.now() + FOLLOWUP_BUDGET_MS;
+  let attempts = 0;
+  let ackMissRetry = 0;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  while (attempts < FOLLOWUP_MAX_ATTEMPTS) {
     const remaining = deadline - Date.now();
     if (remaining < 50) {
-      followupFail('patch_budget_exhausted');
+      emitFollowup('warn', {
+        diagnostic_id,
+        outcome: 'failure',
+        reason: 'patch_budget_exhausted',
+        attempts
+      });
       return;
     }
 
+    attempts += 1;
     let response;
     try {
       response = await fetcher(url, {
@@ -371,29 +402,79 @@ async function patchOriginalResponse(fetcher, applicationId, token, content) {
         redirect: 'error'
       });
     } catch {
-      followupFail('patch_network_error');
+      emitFollowup('warn', {
+        diagnostic_id,
+        outcome: 'failure',
+        reason: 'patch_network_error',
+        attempts
+      });
       return;
     }
 
     if (response.ok) {
       try { await response.arrayBuffer(); } catch { /* ignore */ }
+      emitFollowup('info', {
+        diagnostic_id,
+        outcome: 'success',
+        reason: 'patch_ok',
+        http_status: response.status,
+        attempts
+      });
       return;
     }
 
-    if (response.status === 429 && attempt === 0) {
-      try { await response.arrayBuffer(); } catch { /* ignore */ }
+    const discord_error_code = await parseSafeDiscordErrorCode(response);
+    const left = deadline - Date.now();
+
+    if (response.status === 429) {
       const retryMs = parseRetryAfterMs(response);
       const waitMs = retryMs == null ? 250 : retryMs;
-      const left = deadline - Date.now();
-      if (waitMs > FOLLOWUP_RETRY_MAX_MS || waitMs > left - 50) {
-        followupFail('patch_failed', 429);
+      if (attempts >= FOLLOWUP_MAX_ATTEMPTS || waitMs > FOLLOWUP_RETRY_MAX_MS || waitMs > left - 50) {
+        emitFollowup('warn', {
+          diagnostic_id,
+          outcome: 'failure',
+          reason: 'patch_failed',
+          http_status: 429,
+          discord_error_code,
+          attempts
+        });
         return;
       }
       await sleep(waitMs);
       continue;
     }
 
-    followupFail('patch_failed', response.status);
+    if (
+      response.status === 404
+      && discord_error_code != null
+      && ACK_MISS_CODES.has(discord_error_code)
+      && ackMissRetry < ACK_MISS_DELAYS_MS.length
+      && attempts < FOLLOWUP_MAX_ATTEMPTS
+    ) {
+      const waitMs = ACK_MISS_DELAYS_MS[ackMissRetry++];
+      if (waitMs > left - 50) {
+        emitFollowup('warn', {
+          diagnostic_id,
+          outcome: 'failure',
+          reason: 'patch_failed',
+          http_status: 404,
+          discord_error_code,
+          attempts
+        });
+        return;
+      }
+      await sleep(waitMs);
+      continue;
+    }
+
+    emitFollowup('warn', {
+      diagnostic_id,
+      outcome: 'failure',
+      reason: 'patch_failed',
+      http_status: response.status,
+      discord_error_code,
+      attempts
+    });
     return;
   }
 }
@@ -503,13 +584,47 @@ async function runAuthorizedWork(interaction, env, defaults, validateSource, ser
   return 'Não foi possível processar o pedido.';
 }
 
-async function respondAuthorized(interaction, env, defaults, validateSource, services) {
+function isImmediateDeferCommand(interaction) {
+  const name = interaction.data && interaction.data.name;
+  if (name === 'links') {
+    const sub = commandSub(interaction.data, 'links');
+    return Boolean(sub && sub.name === 'testar');
+  }
+  if (name === 'monitor') {
+    const sub = commandSub(interaction.data, 'monitor');
+    return Boolean(sub && sub.name === 'testar');
+  }
+  return false;
+}
+
+function scheduleFollowup(services, fetcher, applicationId, token, contentPromise, diagnostic_id) {
+  services.waitUntil((async () => {
+    let content;
+    try {
+      content = await contentPromise;
+    } catch {
+      content = 'Não foi possível processar o pedido.';
+    }
+    if (typeof content !== 'string') content = 'Não foi possível processar o pedido.';
+    await patchOriginalResponse(fetcher, applicationId, token, content, diagnostic_id);
+  })());
+}
+
+async function respondAuthorized(interaction, env, defaults, validateSource, services, diagnostic_id) {
   const name = interaction.data && interaction.data.name;
   if (name === 'ajuda') {
     if (interaction.data.options && interaction.data.options.length) {
       return ephemeral('Não foi possível processar o pedido.');
     }
-    return ephemeral(helpContent());
+    return Response.json({
+      type: 4,
+      data: {
+        content: helpContent(),
+        embeds: helpEmbeds(),
+        flags: 64,
+        allowed_mentions: { parse: [] }
+      }
+    });
   }
 
   const work = () => runAuthorizedWork(interaction, env, defaults, validateSource, services);
@@ -529,18 +644,34 @@ async function respondAuthorized(interaction, env, defaults, validateSource, ser
   }
 
   const fetcher = typeof services.fetcher === 'function' ? services.fetcher : fetch;
-  services.waitUntil((async () => {
-    let content;
-    try {
-      content = await work();
-    } catch {
-      content = 'Não foi possível processar o pedido.';
-    }
-    if (typeof content !== 'string') content = 'Não foi possível processar o pedido.';
-    await patchOriginalResponse(fetcher, applicationId, token, content);
-  })());
+  const workPromise = Promise.resolve()
+    .then(() => work())
+    .then(content => (typeof content === 'string' ? content : 'Não foi possível processar o pedido.'))
+    .catch(() => 'Não foi possível processar o pedido.');
 
-  return deferredEphemeral();
+  if (isImmediateDeferCommand(interaction)) {
+    scheduleFollowup(services, fetcher, applicationId, token, workPromise, diagnostic_id);
+    return deferredEphemeral();
+  }
+
+  let timer = null;
+  try {
+    const raced = await Promise.race([
+      workPromise.then(content => ({ slow: false, content })),
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve({ slow: true }), FAST_REPLY_BUDGET_MS);
+      })
+    ]);
+
+    if (!raced.slow) {
+      return ephemeral(raced.content);
+    }
+
+    scheduleFollowup(services, fetcher, applicationId, token, workPromise, diagnostic_id);
+    return deferredEphemeral();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export async function handleLinksInteraction(request, env, defaults, validateSource, services = {}) {
@@ -573,7 +704,7 @@ export async function handleLinksInteraction(request, env, defaults, validateSou
     if (!interaction.guild_id || interaction.guild_id !== env.DISCORD_GUILD_ID) return ephemeral('Comando indisponível.');
     if (!hasGuildManagePermission(interaction.member)) return ephemeral('Sem permissão para gerir fontes.');
 
-    return respondAuthorized(interaction, env, defaults, validateSource, services);
+    return respondAuthorized(interaction, env, defaults, validateSource, services, diagnostic_id);
   } catch {
     return ephemeral('Não foi possível processar o pedido.');
   }

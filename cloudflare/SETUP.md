@@ -212,7 +212,7 @@ try {
 
 You can also run the registration script with Node 22 directly (`node scripts/register-commands.mjs`). `npm install` is not strictly required for registration alone; deps are still needed for tests and deploy. Do not paste the bot token into a command line that lands in history or source files. After this one-time deploy and registration, Discord commands change D1 sources/settings without further deploys. Rerun registration once after a code upgrade that adds or changes command definitions — not on every config/settings change.
 
-Interaction handlers defer acknowledgment and edit the private original response so long store fetches (for example `/links testar`) stay within Discord’s timing rules. Follow-up edit budget is **8s**; `/links testar` store fetch/parse is capped at **20s**.
+`/ajuda` always replies immediately (private). Other fast commands normally return a complete private reply directly (bounded ~1.3s; fall back to deferred only if slow). `/links testar` and `/monitor testar` still acknowledge then edit the private original. Follow-up edit budget is **8s**; `/links testar` store fetch/parse is capped at **20s**.
 
 ### Command reference
 
