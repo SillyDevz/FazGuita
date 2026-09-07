@@ -1,8 +1,12 @@
 {
   "enabled": false,
+  "sources": [
+    "https://geekhaven.pt/collections/pokemon",
+    "https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01"
+  ],
   "alertOnNewProducts": true,
   "alertOnRestocks": true,
-  "alertOnSoldOutListings": true,
+  "alertOnSoldOutListings": false,
   "includeKeywords": [],
   "excludeKeywords": []
 }

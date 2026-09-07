@@ -2,6 +2,10 @@
   "name": "geekhaven-discord-monitor",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node --test", "deploy": "wrangler deploy" },
+  "scripts": {
+    "test": "node --test",
+    "deploy": "wrangler deploy",
+    "register:commands": "node scripts/register-commands.mjs"
+  },
   "devDependencies": { "wrangler": "^4.0.0" }
 }

@@ -11,7 +11,7 @@ try {
         [pscustomobject]@{kind='NEW PRODUCT';title='Elite Trainer Box';available=$false},
         [pscustomobject]@{kind='RESTOCK';title='Booster Pack';available=$true}
     )
-    Assert (@(Select-Alerts $changes $settings).Count -eq 3) 'Defaults changed.'
+    Assert (@(Select-Alerts $changes $settings).Count -eq 2) 'Defaults changed.'
     $settings.alertOnNewProducts = $false
     Assert (@(Select-Alerts $changes $settings).Count -eq 1) 'New product toggle failed.'
     $settings.alertOnNewProducts = $true

@@ -5,3 +5,9 @@ CREATE TABLE IF NOT EXISTS monitor (
   lease_token TEXT
 );
 INSERT OR IGNORE INTO monitor (id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS source_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  sources TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 0
+);

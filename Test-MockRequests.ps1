@@ -4,13 +4,18 @@ $monitor = Join-Path $PSScriptRoot 'Watch-Pokemon.ps1'
 $prefix = Join-Path $PSScriptRoot ('mock-test-' + [guid]::NewGuid().ToString())
 $state = "$prefix-state.json"
 $fixturePath = "$prefix-response.json"
+$configPath = "$prefix-config.json"
+$config = Get-Content (Join-Path $PSScriptRoot 'config.json') -Raw | ConvertFrom-Json
+$config.sources = @('https://geekhaven.pt/collections/pokemon')
+$config.alertOnSoldOutListings = $true
+$config | ConvertTo-Json -Depth 8 | Set-Content $configPath
 
 function Set-Response($Products, [int]$Status = 200, [string]$RawBody = '', [string]$RetryAfter = '') {
     $body = if ($RawBody) { $RawBody } else { @{products=@($Products)} | ConvertTo-Json -Depth 10 }
     @{status=$Status; body=$body; retryAfter=$RetryAfter} | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $fixturePath -Encoding UTF8
 }
 function Invoke-Mock([switch]$Silent, [switch]$OnlyNew) {
-    $lines = & $monitor -Once -MockResponsePath $fixturePath -StatePath $state -MockMute:($Silent -or $MuteSound) -NewOnly:$OnlyNew 6>&1 3>&1
+    $lines = & $monitor -ConfigPath $configPath -Once -MockResponsePath $fixturePath -StatePath $state -MockMute:($Silent -or $MuteSound) -NewOnly:$OnlyNew 6>&1 3>&1
     $output = ($lines | ForEach-Object { $_.ToString() }) -join "`n"
     Write-Host $output
     return $output
@@ -47,7 +52,7 @@ try {
     Assert-Contains $output '[RESTOCK] MOCK Existing Booster'
     if (-not $MuteSound) { Assert-Contains $output 'Alert sound played 5 times.' }
     $history = Get-Content -LiteralPath $state -Raw | ConvertFrom-Json
-    if ($history.products.Count -ne 2) { throw 'New product not saved.' }
+    if ($history.sources[0].products.Count -ne 2) { throw 'New product not saved.' }
 
     Write-Host '3. Same response after restart: no duplicate alert.' -ForegroundColor Cyan
     Assert-NoAlert (Invoke-Mock -Silent)
@@ -73,7 +78,7 @@ try {
     if ($output.Contains('[RESTOCK]')) { throw 'NewOnly emitted a restock.' }
     Write-Host 'PASS: all mock request scenarios. Real history was not used.' -ForegroundColor Green
 } finally {
-    foreach ($path in @($fixturePath,$state,"$state.tmp","$state.bak","$state.lock")) {
+    foreach ($path in @($configPath,$fixturePath,$state,"$state.tmp","$state.bak","$state.lock")) {
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
     }
 }

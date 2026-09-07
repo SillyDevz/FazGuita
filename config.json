@@ -1,11 +1,15 @@
 {
+  "sources": [
+    "https://geekhaven.pt/collections/pokemon",
+    "https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01"
+  ],
   "soundFile": "level-up-ringtone.mp3",
   "volume": 100,
   "soundRepeats": 5,
   "intervalSeconds": 15,
   "alertOnNewProducts": true,
   "alertOnRestocks": true,
-  "alertOnSoldOutListings": true,
+  "alertOnSoldOutListings": false,
   "includeKeywords": [],
   "excludeKeywords": [],
   "openBrowserOnAlert": false

@@ -18,8 +18,8 @@ function Read-AlertConfig([string]$Path) {
         $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
         $config = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
         $defaults = @{
-            alertOnNewProducts=$true; alertOnRestocks=$true; alertOnSoldOutListings=$true
-            soundRepeats=5; intervalSeconds=15; includeKeywords=@(); excludeKeywords=@(); openBrowserOnAlert=$false
+            alertOnNewProducts=$true; alertOnRestocks=$true; alertOnSoldOutListings=$false
+            sources=@('https://geekhaven.pt/collections/pokemon'); soundRepeats=5; intervalSeconds=15; includeKeywords=@(); excludeKeywords=@(); openBrowserOnAlert=$false
         }
         foreach ($key in $defaults.Keys) {
             if ($null -eq $config.PSObject.Properties[$key]) { $config | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key] }
@@ -39,6 +39,8 @@ function Read-AlertConfig([string]$Path) {
                 if ($word -isnot [string] -or [string]::IsNullOrWhiteSpace($word)) { throw "$key must contain nonempty strings." }
             }
         }
+        if ($config.sources -isnot [array] -or $config.sources.Count -eq 0) { throw 'sources must be a nonempty array of URLs.' }
+        $config.sources = @($config.sources | ForEach-Object { (Get-Source $_).url } | Select-Object -Unique)
         if ($config.soundFile -isnot [string] -or [string]::IsNullOrWhiteSpace($config.soundFile) -or $config.soundFile.Contains('"')) {
             throw 'soundFile must be a nonempty file path without quote characters.'
         }
@@ -126,17 +128,221 @@ namespace PokemonMonitor {
     }
 }
 
-function Get-Changes($Products, $Known, [bool]$IncludeRestocks) {
-    foreach ($product in $Products) {
-        $id = [string]$product.id
-        $available = @($product.variants | Where-Object { $_.available -eq $true }).Count -gt 0
-        $kind = $null
-        if (-not $Known.ContainsKey($id)) { $kind = 'NEW PRODUCT' }
-        elseif ($IncludeRestocks -and $available -and -not $Known[$id].available) { $kind = 'RESTOCK' }
-        if ($kind) {
-            [pscustomobject]@{kind=$kind; title=$product.title; available=$available; url=('https://geekhaven.pt/products/' + $product.handle)}
+function Get-Source($Url) {
+    if ($Url -isnot [string]) { throw 'Source must be an HTTPS URL.' }
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https' -or $uri.UserInfo) { throw 'Source must be an HTTPS URL without credentials.' }
+    $path = $uri.AbsolutePath.TrimEnd('/')
+    $origin = $uri.GetLeftPart([UriPartial]::Authority)
+    if ($uri.Host -in @('continente.pt','www.continente.pt')) {
+        if ($path -match '^/produto/[^/]+-(\d+)\.html$') {
+            return [pscustomobject]@{url="$origin$path"; endpoint="$origin$path"; origin=$origin; kind='continente'; sku=$Matches[1]}
+        }
+        if ($path -eq '/pesquisa') {
+            $allowed = @('q','srule','pmin','pmax','start','sz')
+            $selected = @{}
+            $raw = $uri.Query.TrimStart('?')
+            if ($raw) {
+                foreach ($part in $raw.Split('&')) {
+                    if ($part.Length -eq 0) { continue }
+                    $eq = $part.IndexOf('=')
+                    if ($eq -lt 0) { $name = $part; $value = '' } else { $name = $part.Substring(0, $eq); $value = $part.Substring($eq + 1) }
+                    $key = [Uri]::UnescapeDataString($name.Replace('+',' '))
+                    if ($key -notin $allowed) { continue }
+                    if ($selected.ContainsKey($key)) { throw 'Continente search rejects duplicate filters.' }
+                    $selected[$key] = $value
+                }
+            }
+            if (-not $selected.ContainsKey('q')) { throw 'Continente search requires a nonempty q parameter.' }
+            $q = [Uri]::UnescapeDataString([string]$selected['q'].Replace('+',' ')).Trim()
+            if ([string]::IsNullOrWhiteSpace($q)) { throw 'Continente search requires a nonempty q parameter.' }
+            $selected['q'] = [Uri]::EscapeDataString($q)
+            if ($selected.ContainsKey('start')) {
+                $startValue = [Uri]::UnescapeDataString([string]$selected['start'].Replace('+',' '))
+                if ($startValue -notmatch '^(0|[1-9]\d*)$') { throw 'Continente search start must be a nonnegative integer.' }
+                $selected['start'] = $startValue
+            }
+            if ($selected.ContainsKey('sz')) {
+                $szValue = [Uri]::UnescapeDataString([string]$selected['sz'].Replace('+',' '))
+                if ($szValue -notmatch '^[1-9]\d*$') { throw 'Continente search sz must be a positive integer.' }
+                $selected['sz'] = $szValue
+            }
+            $query = (($selected.Keys | Sort-Object) | ForEach-Object { "$_=$($selected[$_])" }) -join '&'
+            $canonical = "https://www.continente.pt/pesquisa/?$query"
+            return [pscustomobject]@{url=$canonical; endpoint=$canonical; origin='https://www.continente.pt'; kind='continente-search'}
+        }
+        throw 'Continente requires a /produto/*.html or /pesquisa/?q=... link.'
+    }
+    if ($path -match '^/collections/[^/]+(?:/products\.json)?$' -or $path -eq '/products.json') {
+        if ($path -ne '/products.json') { $path = $path -replace '/products\.json$', '' }
+        $endpoint = if ($path -eq '/products.json') { "$origin$path" } else { "$origin$path/products.json" }
+        return [pscustomobject]@{url="$origin$path"; endpoint=$endpoint; origin=$origin; kind='collection'}
+    }
+    if ($path -match '^/products/[^/.]+(?:\.json)?$') {
+        $path = $path -replace '\.json$', ''
+        return [pscustomobject]@{url="$origin$path"; endpoint="$origin$path.json"; origin=$origin; kind='product'}
+    }
+    throw 'Unsupported source path. Use a Shopify collection/product or Continente product/search URL.'
+}
+
+function Get-Availability($Product) {
+    if (-not $Product.id -or -not $Product.handle -or $Product.variants -isnot [array] -or $Product.variants.Count -eq 0) { throw 'Invalid product record.' }
+    foreach ($variant in $Product.variants) {
+        if ($variant.available -isnot [bool]) { throw 'Invalid product availability: expected a boolean.' }
+    }
+    return @($Product.variants | Where-Object { $_.available -eq $true }).Count -gt 0
+}
+
+function Get-JsonLdProducts($Node) {
+    if ($null -eq $Node) { return }
+    if ($Node -is [array]) { foreach ($item in $Node) { Get-JsonLdProducts $item }; return }
+    if (@($Node.'@type') -contains 'Product') { $Node }
+    if ($Node.'@graph') { Get-JsonLdProducts $Node.'@graph' }
+}
+
+function Convert-SourceBody([string]$Body, $Source) {
+    if ($Source.kind -ne 'continente') {
+        try { $data = $Body | ConvertFrom-Json } catch { throw 'Invalid product JSON.' }
+        if ($Source.kind -eq 'product') {
+            if ($null -eq $data.product) { throw 'Invalid product response.' }
+            $products = @($data.product)
+        } else {
+            if ($data.products -isnot [array]) { throw 'Invalid product feed: missing products array.' }
+            $products = @($data.products)
+        }
+        foreach ($product in $products) { $null = Get-Availability $product }
+        return $products
+    }
+    $matchesProduct = @()
+    foreach ($script in [regex]::Matches($Body, '(?is)<script\b[^>]*\btype\s*=\s*["'']application/ld\+json["''][^>]*>(.*?)</script>')) {
+        $nodes = Get-JsonLdProducts ($script.Groups[1].Value | ConvertFrom-Json)
+        $matchesProduct += @($nodes | Where-Object { [string]$_.sku -eq $Source.sku })
+    }
+    if ($matchesProduct.Count -ne 1) { throw 'Invalid Continente product: missing or ambiguous matching SKU.' }
+    $product = $matchesProduct[0]
+    $offers = @($product.offers)
+    if ($offers.Count -eq 0) { throw 'Missing Continente offers.' }
+    $statuses = @()
+    foreach ($offer in $offers) {
+        switch -Regex ($offer.availability) {
+            '^https?://schema\.org/InStock$' { $statuses += $true; break }
+            '^https?://schema\.org/(OutOfStock|SoldOut|Discontinued)$' { $statuses += $false; break }
+            default { throw 'Unknown Continente availability.' }
         }
     }
+    if (@($statuses | Select-Object -Unique).Count -ne 1) { throw 'Conflicting Continente offers.' }
+    $available = $statuses[0]
+    foreach ($button in [regex]::Matches($Body, '(?is)<button\b([^>]*)>')) {
+        $attrText = $button.Groups[1].Value
+        $attrs = @{}
+        foreach ($attr in [regex]::Matches($attrText, '([\w-]+)\s*=\s*["'']([^"'']*)["'']')) { $attrs[$attr.Groups[1].Value] = $attr.Groups[2].Value }
+        if ($attrs['data-container'] -ne 'pdp' -or $attrs['data-pid'] -ne $Source.sku) { continue }
+        if ($attrs.ContainsKey('data-outofstock')) {
+            if ($attrs['data-outofstock'] -ceq 'true') { $available = $false }
+            elseif ($attrs['data-outofstock'] -cne 'false') { throw 'Unknown Continente PDP availability.' }
+        }
+        if ($attrText -match '(?i)(?:^|\s)disabled(?:\s|=|$)') { $available = $false }
+    }
+    foreach ($div in [regex]::Matches($Body, '(?is)<div\b([^>]*)>')) {
+        $attrs = @{}
+        foreach ($attr in [regex]::Matches($div.Groups[1].Value, '([\w-]+)\s*=\s*["'']([^"'']*)["'']')) { $attrs[$attr.Groups[1].Value] = $attr.Groups[2].Value }
+        $className = [string]$attrs['class']
+        if ($className -notmatch '(?i)(^|\s)product-detail(\s|$)' -or $className -notmatch '(?i)(^|\s)product-wrapper(\s|$)') { continue }
+        if ($attrs['data-pid'] -ne $Source.sku) { continue }
+        if ($attrs.ContainsKey('data-is-product-out-of-stock')) {
+            if ($attrs['data-is-product-out-of-stock'] -ceq 'true') { $available = $false }
+            elseif ($attrs['data-is-product-out-of-stock'] -cne 'false') { throw 'Unknown Continente PDP availability.' }
+        }
+        if ($className -match '(?i)(^|\s)product-out-of-stock(\s|$)') { $available = $false }
+    }
+    if ([string]::IsNullOrWhiteSpace($product.name)) { throw 'Missing Continente product name.' }
+    [pscustomobject]@{id=$Source.sku; title=$product.name; handle=$Source.sku; url=$Source.url; variants=@([pscustomobject]@{available=[bool]$available})}
+}
+
+function Get-ContinenteSearchFooter([string]$Body) {
+    $footers = @([regex]::Matches($Body, '(?is)<div\b([^>]*\bgrid-footer\b[^>]*)>'))
+    if ($footers.Count -ne 1) { throw 'Invalid Continente search page.' }
+    $attrs = @{}
+    foreach ($attr in [regex]::Matches($footers[0].Groups[1].Value, '([\w-]+)\s*=\s*["'']([^"'']*)["'']')) { $attrs[$attr.Groups[1].Value] = $attr.Groups[2].Value }
+    foreach ($key in @('data-total-count','data-page-size','data-page-number')) {
+        if (-not $attrs.ContainsKey($key)) { throw 'Invalid Continente search page.' }
+    }
+    $totalRaw = [string]$attrs['data-total-count']
+    $sizeRaw = [string]$attrs['data-page-size']
+    $numberRaw = [string]$attrs['data-page-number']
+    if ($totalRaw -notmatch '^(0|[1-9]\d*)$' -or $numberRaw -notmatch '^(0|[1-9]\d*)$') { throw 'Invalid Continente search page.' }
+    $sizeValue = 0.0
+    if (-not [double]::TryParse($sizeRaw, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$sizeValue) -or $sizeValue -le 0 -or $sizeValue -ne [Math]::Floor($sizeValue)) {
+        throw 'Invalid Continente search page.'
+    }
+    return [pscustomobject]@{totalCount=[int]$totalRaw; pageSize=[int]$sizeValue; pageNumber=[int]$numberRaw}
+}
+
+function Get-ContinenteSearchProductUrls([string]$Body, [string]$Origin) {
+    $found = [ordered]@{}
+    $tiles = @([regex]::Matches($Body, '(?is)<div class="product" data-pid="(\d+)">'))
+    for ($i = 0; $i -lt $tiles.Count; $i++) {
+        $sku = $tiles[$i].Groups[1].Value
+        $chunkStart = $tiles[$i].Index + $tiles[$i].Length
+        $chunkEnd = if ($i + 1 -lt $tiles.Count) { $tiles[$i + 1].Index } else { $Body.Length }
+        $chunk = $Body.Substring($chunkStart, $chunkEnd - $chunkStart)
+        $link = [regex]::Match($chunk, '(?is)href\s*=\s*["'']([^"'']*?/produto/[^/"''?#]+-' + [regex]::Escape($sku) + '\.html)(?:[?#][^"'']*)?["'']')
+        if (-not $link.Success) { throw 'Invalid Continente search page.' }
+        $href = $link.Groups[1].Value
+        if ($href.StartsWith('/')) { $href = "$Origin$href" }
+        $productUri = $null
+        if (-not [Uri]::TryCreate($href, [UriKind]::Absolute, [ref]$productUri) -or $productUri.Scheme -ne 'https') { throw 'Invalid Continente search page.' }
+        if ($productUri.Host -notin @('continente.pt','www.continente.pt')) { throw 'Invalid Continente search page.' }
+        if ($productUri.AbsolutePath -notmatch '^/produto/[^/]+-(\d+)\.html$' -or $Matches[1] -ne $sku) { throw 'Invalid Continente search page.' }
+        if (-not $found.Contains($sku)) { $found[$sku] = "$Origin$($productUri.AbsolutePath)" }
+    }
+    return @($found.GetEnumerator() | ForEach-Object { [pscustomobject]@{sku=$_.Key; url=$_.Value} })
+}
+
+function Get-ContinenteSearchPageUrl($Source, [int]$Start) {
+    $uri = [Uri]$Source.url
+    $selected = @{}
+    $raw = $uri.Query.TrimStart('?')
+    if ($raw) {
+        foreach ($part in $raw.Split('&')) {
+            if ($part.Length -eq 0) { continue }
+            $eq = $part.IndexOf('=')
+            if ($eq -lt 0) { $name = $part; $value = '' } else { $name = $part.Substring(0, $eq); $value = $part.Substring($eq + 1) }
+            $selected[$name] = $value
+        }
+    }
+    $selected['start'] = [string]$Start
+    $query = (($selected.Keys | Sort-Object) | ForEach-Object { "$_=$($selected[$_])" }) -join '&'
+    return "https://www.continente.pt/pesquisa/?$query"
+}
+
+function Get-Changes($Products, $Known, [bool]$IncludeRestocks, [string]$Origin = 'https://geekhaven.pt') {
+    foreach ($product in $Products) {
+        $id = [string]$product.id
+        $available = Get-Availability $product
+        $kind = $null
+        if (-not $Known.ContainsKey($id)) { $kind = 'NEW PRODUCT' }
+        elseif ($IncludeRestocks -and $available -and $Known[$id].available -is [bool] -and -not $Known[$id].available) { $kind = 'RESTOCK' }
+        if ($kind) {
+            $url = if ($product.url) { $product.url } else { "$Origin/products/$($product.handle)" }
+            [pscustomobject]@{kind=$kind; title=$product.title; available=$available; url=$url}
+        }
+    }
+}
+
+function Read-SourceHistory($Saved) {
+    $history = @{}
+    if ($Saved.version -eq 1) {
+        $history['https://geekhaven.pt/collections/pokemon'] = @{initialized=$true; products=@{}; etag=$null; failures=0; nextCheck=[datetime]::MinValue}
+        foreach ($entry in $Saved.products) { $history['https://geekhaven.pt/collections/pokemon'].products[[string]$entry.id] = $entry }
+    } elseif ($Saved.version -eq 2) {
+        foreach ($source in $Saved.sources) {
+            $known = @{}
+            foreach ($entry in $source.products) { $known[[string]$entry.id] = $entry }
+            $history[$source.url] = @{initialized=$true; products=$known; etag=$null; failures=0; nextCheck=[datetime]::MinValue}
+        }
+    } else { throw 'Unsupported state format.' }
+    return $history
 }
 
 function Get-RetryDelay($Response, [int]$Failures) {
@@ -180,14 +386,10 @@ if ($MockResponsePath) {
 }
 $StatePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StatePath)
 
-$known = @{}
-$initialized = Test-Path -LiteralPath $StatePath
-if ($initialized) {
-    try {
-        $saved = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
-        if ($saved.version -ne 1) { throw 'Unsupported state format.' }
-        foreach ($entry in $saved.products) { $known[[string]$entry.id] = $entry }
-    } catch { throw "Cannot read saved history at $StatePath. Restore it or rename it to create a fresh baseline. $_" }
+$history = @{}
+if (Test-Path -LiteralPath $StatePath) {
+    try { $history = Read-SourceHistory (Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json) }
+    catch { throw "Cannot read saved history at $StatePath. Restore it or rename it to create a fresh baseline. $_" }
 }
 
 # An exclusive lock prevents duplicate monitors from doubling traffic or corrupting history.
@@ -201,26 +403,48 @@ try {
     $client = New-Object System.Net.Http.HttpClient($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(25)
     $client.DefaultRequestHeaders.UserAgent.ParseAdd('GeekHavenPersonalMonitor/1.0')
-    $etag = $null
-    $failures = 0
-    Write-Host "Watching Geek Haven Pokemon every $IntervalSeconds seconds. Ctrl+C stops. Keep this terminal and PC awake."
+    Write-Host "Watching configured sources every $IntervalSeconds seconds. Ctrl+C stops. Keep this terminal and PC awake."
     Write-Host "History: $StatePath"
     do {
         $alertConfig = Update-AlertConfig $ConfigPath $alertConfig
         if (-not $intervalOverride) { $IntervalSeconds = $alertConfig.intervalSeconds }
+        foreach ($sourceUrl in $alertConfig.sources) {
+        $source = Get-Source $sourceUrl
+        if (-not $history.ContainsKey($source.url)) {
+            $history[$source.url] = @{initialized=$false; products=@{}; etag=$null; failures=0; nextCheck=[datetime]::MinValue}
+        }
+        $sourceState = $history[$source.url]
+        if ([datetime]::UtcNow -lt $sourceState.nextCheck) { continue }
+        $known = $sourceState.products
+        $initialized = $sourceState.initialized
+        $etag = $sourceState.etag
+        $failures = $sourceState.failures
         $delay = $IntervalSeconds
         try {
             $products = @()
             $page = 1
             $nextEtag = $null
             $unchanged = $false
-            do {
-                $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, "https://geekhaven.pt/collections/pokemon/products.json?limit=250&page=$page")
-                if ($page -eq 1 -and $etag) { $request.Headers.TryAddWithoutValidation('If-None-Match', $etag) | Out-Null }
+            $mockRoot = $null
+            if ($MockResponsePath) { $mockRoot = Get-Content -LiteralPath $MockResponsePath -Raw | ConvertFrom-Json }
+            $send = {
+                param($RequestUrl, [bool]$UseEtag)
+                $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $RequestUrl)
+                if ($UseEtag -and $etag) { $request.Headers.TryAddWithoutValidation('If-None-Match', $etag) | Out-Null }
                 $response = $null
                 try {
                     if ($MockResponsePath) {
-                        $fixture = Get-Content -LiteralPath $MockResponsePath -Raw | ConvertFrom-Json
+                        $fixture = $mockRoot
+                        if ($fixture.sources) {
+                            $fixture = $fixture.sources.PSObject.Properties[$source.url].Value
+                            if ($null -eq $fixture) { throw 'Missing source mock response.' }
+                        }
+                        $mapped = $null
+                        if ($fixture.PSObject.Properties['responses']) { $mapped = $fixture.responses.PSObject.Properties[$RequestUrl].Value }
+                        if ($null -ne $mapped) { $fixture = $mapped }
+                        elseif ($RequestUrl -ne $source.endpoint -and $RequestUrl -ne $source.url -and $source.kind -eq 'continente-search') {
+                            throw "Missing mock response for $RequestUrl"
+                        }
                         $mockStatus = [Enum]::ToObject([System.Net.HttpStatusCode], [int]$fixture.status)
                         $response = New-Object System.Net.Http.HttpResponseMessage($mockStatus)
                         $response.Content = New-Object System.Net.Http.StringContent([string]$fixture.body)
@@ -229,33 +453,84 @@ try {
                         $response = $client.SendAsync($request).GetAwaiter().GetResult()
                     }
                     $status = [int]$response.StatusCode
-                    if ($status -eq 304) { $unchanged = $true; break }
+                    if ($status -eq 304) { return [pscustomobject]@{unchanged=$true} }
                     if ($status -in @(401,403)) { throw "STOP: HTTP $status. Access denied; monitor will not attempt to bypass it." }
                     if (-not $response.IsSuccessStatusCode) {
-                        $delay = Get-RetryDelay $response ($failures + 1)
+                        Set-Variable -Name delay -Value (Get-RetryDelay $response ($failures + 1)) -Scope 1
                         throw "HTTP $status"
                     }
-                    $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-                    if ($null -eq $body.products) { throw 'Invalid product feed: missing products array.' }
-                    $batch = @($body.products)
-                    foreach ($product in $batch) {
-                        if (-not $product.id -or -not $product.handle -or $null -eq $product.variants) { throw 'Invalid product record.' }
-                    }
-                    $products += $batch
-                    if ($page -eq 1 -and $batch.Count -lt 250 -and $response.Headers.ETag) { $nextEtag = $response.Headers.ETag.ToString() }
+                    $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    $responseEtag = if ($response.Headers.ETag) { $response.Headers.ETag.ToString() } else { $null }
+                    return [pscustomobject]@{unchanged=$false; body=$body; etag=$responseEtag}
                 } finally {
                     if ($response) { $response.Dispose() }
                     $request.Dispose()
                 }
-                if ($batch.Count -lt 250) { break }
-                $page++
-                if ($page -gt 100) { throw 'Pagination exceeded safety limit; history not changed.' }
-                Start-Sleep -Seconds $IntervalSeconds
-            } while ($true)
+            }
+            if ($source.kind -eq 'continente-search') {
+                $detailUrls = [ordered]@{}
+                $initialStart = 0
+                $expectedTotal = $null
+                $sourceUri = [Uri]$source.url
+                $startMatch = [regex]::Match($sourceUri.Query, '(?i)(?:\?|&)start=([^&]*)')
+                if ($startMatch.Success) { $initialStart = [int][Uri]::UnescapeDataString($startMatch.Groups[1].Value.Replace('+',' ')) }
+                $start = $initialStart
+                for ($listingPage = 1; ; $listingPage++) {
+                    if ($listingPage -gt 5) { throw 'Continente search exceeded 5 listing pages; history not changed.' }
+                    $requestUrl = if ($listingPage -eq 1) { $source.endpoint } else { Get-ContinenteSearchPageUrl $source $start }
+                    $result = & $send $requestUrl $false
+                    if ($result.unchanged) { throw 'Unexpected Continente search HTTP 304.' }
+                    $footer = Get-ContinenteSearchFooter $result.body
+                    if ($start -ne ($footer.pageNumber * $footer.pageSize)) { throw 'Invalid Continente search page.' }
+                    if ($null -eq $expectedTotal) { $expectedTotal = $footer.totalCount }
+                    elseif ($footer.totalCount -ne $expectedTotal) { throw 'Invalid Continente search page.' }
+                    $links = @(Get-ContinenteSearchProductUrls $result.body $source.origin)
+                    if ($footer.totalCount -eq 0) {
+                        if ($links.Count -ne 0) { throw 'Invalid Continente search page.' }
+                        break
+                    }
+                    if ($links.Count -eq 0) { throw 'Invalid Continente search page.' }
+                    foreach ($link in $links) {
+                        if ($detailUrls.Contains($link.sku)) { continue }
+                        if ($detailUrls.Count -ge 30) { throw 'Continente search exceeded 30 products; history not changed.' }
+                        $detailUrls[$link.sku] = $link.url
+                    }
+                    $nextStart = $start + $footer.pageSize
+                    if ($nextStart -ge $footer.totalCount) { break }
+                    $start = $nextStart
+                    if (-not $MockResponsePath) { Start-Sleep -Seconds $IntervalSeconds }
+                }
+                if ($null -eq $expectedTotal) { throw 'Invalid Continente search page.' }
+                if ($detailUrls.Count -ne ($expectedTotal - $initialStart)) { throw 'Continente search product count mismatch; history not changed.' }
+                if ($detailUrls.Count -gt 30) { throw 'Continente search exceeded 30 products; history not changed.' }
+                $pdpIndex = 0
+                foreach ($entry in $detailUrls.GetEnumerator()) {
+                    $pdpSource = Get-Source $entry.Value
+                    $result = & $send $entry.Value $false
+                    if ($result.unchanged) { throw 'Unexpected Continente product HTTP 304.' }
+                    $products += @(Convert-SourceBody $result.body $pdpSource)
+                    $pdpIndex++
+                    if (-not $MockResponsePath -and $pdpIndex -lt $detailUrls.Count) { Start-Sleep -Seconds 1 }
+                }
+                $nextEtag = $null
+            } else {
+                do {
+                    $requestUrl = if ($source.kind -eq 'collection') { "$($source.endpoint)?limit=250&page=$page" } else { $source.endpoint }
+                    $result = & $send $requestUrl ($page -eq 1)
+                    if ($result.unchanged) { $unchanged = $true; break }
+                    $batch = @(Convert-SourceBody $result.body $source)
+                    $products += $batch
+                    if ($page -eq 1 -and $batch.Count -lt 250 -and $result.etag) { $nextEtag = $result.etag }
+                    if ($source.kind -ne 'collection' -or $batch.Count -lt 250) { break }
+                    $page++
+                    if ($page -gt 100) { throw 'Pagination exceeded safety limit; history not changed.' }
+                    Start-Sleep -Seconds $IntervalSeconds
+                } while ($true)
+            }
 
             if (-not $unchanged) {
                 $changes = @()
-                if ($initialized) { $changes = @(Get-Changes $products $known (-not $NewOnly)) }
+                if ($initialized) { $changes = @(Get-Changes $products $known (-not $NewOnly) $source.origin) }
                 $changes = @(Select-Alerts $changes $alertConfig)
                 foreach ($change in $changes) {
                     $stock = if ($change.available) { 'IN STOCK' } else { 'SOLD OUT' }
@@ -275,25 +550,30 @@ try {
                 }
                 foreach ($product in $products) {
                     $id = [string]$product.id
-                    $known[$id] = [pscustomobject]@{id=$id; available=(@($product.variants | Where-Object { $_.available -eq $true }).Count -gt 0)}
+                    $known[$id] = [pscustomobject]@{id=$id; available=(Get-Availability $product)}
                 }
                 # Retain IDs of removed products so reordering/removal doesn't create false new alerts.
-                $json = @{version=1; products=@($known.Values)} | ConvertTo-Json -Depth 5
+                $sourceState.initialized = $true
+                $savedSources = @($history.Keys | Where-Object { $history[$_].initialized } | ForEach-Object { @{url=$_; products=@($history[$_].products.Values)} })
+                $json = @{version=2; sources=$savedSources} | ConvertTo-Json -Depth 8
                 Save-History $StatePath $json
                 if (-not $initialized) { Write-Host "Baseline saved: $($products.Count) products. Future additions will alert." }
                 $initialized = $true
-                $etag = $nextEtag
+                $sourceState.etag = $nextEtag
             }
-            $failures = 0
+            $sourceState.failures = 0
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Check OK$(if ($unchanged) { ' (unchanged)' })."
         } catch {
-            if ($_.Exception.Message.StartsWith('STOP:')) { throw }
+            if ($_.Exception.Message.StartsWith('STOP:') -and $alertConfig.sources.Count -eq 1) { throw }
             $failures++
+            $sourceState.failures = $failures
             $delay = [Math]::Max($delay, [Math]::Min(900,30 * [Math]::Pow(2,[Math]::Min($failures - 1,5))))
-            Write-Warning "Check failed: $($_.Exception.Message). Retrying in $delay seconds."
-            if ($Once) { throw }
+            Write-Warning "$($source.url) check failed: $($_.Exception.Message). Retrying in $delay seconds."
+            if ($Once -and $alertConfig.sources.Count -eq 1) { throw }
         }
-        if (-not $Once) { Start-Sleep -Seconds ([int]$delay) }
+        $sourceState.nextCheck = [datetime]::UtcNow.AddSeconds($delay)
+        }
+        if (-not $Once) { Start-Sleep -Seconds $IntervalSeconds }
     } while (-not $Once)
 } finally {
     if ($client) { $client.Dispose() }
