@@ -953,7 +953,7 @@ test('deferred ack then patch for slow services without leaking tokens', async (
     assert.equal(patches[0].method, 'PATCH');
     assert.match(patches[0].url, new RegExp(`/webhooks/${APP}/`));
     assert.match(patches[0].url, /\/messages\/@original$/);
-    assert.equal(patches[0].redirect, 'error');
+    assert.equal(patches[0].redirect, 'manual');
     assert.match(patches[0].body.content, /disponíveis: 2/);
     assert.deepEqual(patches[0].body.allowed_mentions, { parse: [] });
     assert.equal(JSON.stringify(patches[0].headers || {}).includes(INTERACTION_TOKEN), false);
@@ -1686,5 +1686,258 @@ test('followup retries early 404 ack-miss then succeeds; permanent failure stays
     assert.ok(failFollowups.some(r => r.outcome === 'failure' && r.http_status === 404 && r.discord_error_code === 10008 && r.attempts === 3));
     assert.equal(JSON.stringify(failed.logs).includes('SECRET_TOKEN'), false);
     assert.equal(JSON.stringify(failed.logs).includes(INTERACTION_TOKEN), false);
+  } finally { x.sql.close(); }
+});
+
+test('hanging deferred work times out once; late settle does not second-edit', async (t) => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  const origAbortTimeout = AbortSignal.timeout.bind(AbortSignal);
+  const abortTimeoutMs = [];
+  try {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const background = [];
+    const patches = [];
+    let testSourceCalls = 0;
+    const req = await signedRequest(keyPair.privateKey, interactionWithToken({
+      data: linksData('testar', 'https://shop.test/collections/cards')
+    }));
+
+    AbortSignal.timeout = (ms) => {
+      abortTimeoutMs.push(ms);
+      return origAbortTimeout(ms);
+    };
+
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+
+    const { logs } = await withCapturedLogs(async () => {
+      const services = {
+        settingsDefaults: SETTINGS_DEFAULTS,
+        waitUntil(promise) { background.push(promise); },
+        async fetcher(url, init) {
+          patches.push(JSON.parse(init.body));
+          return { ok: true, status: 200, async arrayBuffer() { return new ArrayBuffer(0); }, headers: { get() { return null; } } };
+        },
+        async testSource() {
+          testSourceCalls += 1;
+          await gate;
+          return { url: 'https://shop.test/collections/cards', products: 9, available: 9, unavailable: 0, unknown: 0 };
+        }
+      };
+
+      const res = await json(await handleLinksInteraction(req, x.env, DEFAULTS, validateSource, services));
+      assert.equal(res.body.type, 5);
+      assert.equal(patches.length, 0);
+      assert.equal(background.length, 1);
+
+      const pending = Promise.all(background);
+      t.mock.timers.tick(21000);
+      await pending;
+
+      assert.equal(patches.length, 1);
+      assert.match(patches[0].content, /Não foi possível confirmar o resultado dentro do prazo/);
+      assert.match(patches[0].content, /pode ainda terminar/);
+      assert.equal(patches[0].content.includes('cancelad'), false);
+      assert.deepEqual(abortTimeoutMs, [7000]);
+      assert.equal(abortTimeoutMs.includes(8000), false);
+
+      release();
+      await gate;
+      await Promise.resolve();
+      await Promise.resolve();
+      t.mock.timers.tick(5000);
+      assert.equal(patches.length, 1);
+      assert.equal(testSourceCalls, 1);
+      assert.deepEqual(abortTimeoutMs, [7000]);
+      return res;
+    });
+
+    const followups = followupRecords(logs);
+    assert.ok(followups.some(r => r.reason === 'work_started' && r.outcome === 'pending' && r.stage === 'work' && r.attempts === 0));
+    assert.ok(followups.some(r => r.reason === 'work_timeout' && r.outcome === 'failure' && r.stage === 'work' && r.attempts === 0));
+    assert.ok(followups.some(r => r.reason === 'patch_ok' && r.outcome === 'success'));
+    assert.equal(followups.some(r => r.reason === 'work_settled'), false);
+    const ids = [...new Set(followups.map(r => r.diagnostic_id))];
+    assert.equal(ids.length, 1);
+    assert.ok(typeof ids[0] === 'string' && ids[0]);
+    assertNoSensitive(logs, [INTERACTION_TOKEN, publicKey, 'SECRET', 'https://shop.test/collections/cards']);
+  } finally {
+    AbortSignal.timeout = origAbortTimeout;
+    x.sql.close();
+  }
+});
+
+test('quick deferred settle clears work timer and does not timeout-edit', async (t) => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    const background = [];
+    const patches = [];
+    const req = await signedRequest(keyPair.privateKey, interactionWithToken({
+      data: linksData('testar', 'https://shop.test/collections/cards')
+    }));
+
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+
+    const { logs } = await withCapturedLogs(async () => {
+      const services = {
+        settingsDefaults: SETTINGS_DEFAULTS,
+        waitUntil(promise) { background.push(promise); },
+        async fetcher(url, init) {
+          patches.push(JSON.parse(init.body));
+          return { ok: true, status: 200, async arrayBuffer() { return new ArrayBuffer(0); }, headers: { get() { return null; } } };
+        },
+        async testSource() {
+          return { url: 'https://shop.test/collections/cards', products: 2, available: 2, unavailable: 0, unknown: 0 };
+        }
+      };
+
+      const res = await json(await handleLinksInteraction(req, x.env, DEFAULTS, validateSource, services));
+      assert.equal(res.body.type, 5);
+      await Promise.all(background);
+      assert.equal(patches.length, 1);
+      assert.match(patches[0].content, /disponíveis: 2/);
+
+      t.mock.timers.tick(30000);
+      await Promise.resolve();
+      assert.equal(patches.length, 1);
+      return res;
+    });
+
+    const followups = followupRecords(logs);
+    assert.ok(followups.some(r => r.reason === 'work_started' && r.stage === 'work' && r.attempts === 0));
+    assert.ok(followups.some(r => r.reason === 'work_settled' && r.outcome === 'pending' && r.stage === 'work' && r.attempts === 0));
+    assert.ok(followups.some(r => r.reason === 'patch_ok'));
+    assert.equal(followups.some(r => r.reason === 'work_timeout'), false);
+    const ids = [...new Set(followups.map(r => r.diagnostic_id))];
+    assert.equal(ids.length, 1);
+    assertNoSensitive(logs, [INTERACTION_TOKEN, publicKey, 'SECRET']);
+  } finally { x.sql.close(); }
+});
+
+test('PATCH rejects redirects without following or reporting success', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    for (const status of [301, 302, 303, 307, 308]) {
+      const background = [];
+      let calls = 0;
+      const { logs } = await withCapturedLogs(async () => {
+        const response = await handleLinksInteraction(
+          await signedRequest(keyPair.privateKey, interactionWithToken({ data: monitorData('testar') })),
+          x.env, DEFAULTS, validateSource, {
+            settingsDefaults: SETTINGS_DEFAULTS,
+            waitUntil(p) { background.push(p); },
+            async sendTest() {},
+            async fetcher(_url, init) {
+              calls++;
+              assert.equal(init.redirect, 'manual');
+              return new Response(null, { status, headers: { Location: 'https://other.test/target' } });
+            }
+          }
+        );
+        assert.equal((await response.json()).type, 5);
+        await Promise.all(background);
+      });
+      assert.equal(calls, 1);
+      const records = followupRecords(logs);
+      assert.ok(records.some(r => r.reason === 'patch_failed' && r.http_status === status));
+      assert.equal(records.some(r => r.reason === 'patch_ok'), false);
+      assertNoSensitive(logs, [INTERACTION_TOKEN, publicKey, 'https://other.test/target']);
+    }
+  } finally { x.sql.close(); }
+});
+
+test('PATCH network error then 200 retries once; one business call', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    const background = [];
+    let fetchCalls = 0;
+    let testSourceCalls = 0;
+    const bodies = [];
+
+    const { logs } = await withCapturedLogs(async () => {
+      const services = {
+        settingsDefaults: SETTINGS_DEFAULTS,
+        waitUntil(promise) { background.push(promise); },
+        async fetcher(url, init) {
+          fetchCalls += 1;
+          bodies.push(init.body);
+          if (fetchCalls === 1) throw new Error('network SECRET_TOKEN');
+          return { ok: true, status: 200, async arrayBuffer() { return new ArrayBuffer(0); }, headers: { get() { return null; } } };
+        },
+        async testSource() {
+          testSourceCalls += 1;
+          return { url: 'https://shop.test/collections/cards', products: 1, available: 1, unavailable: 0, unknown: 0 };
+        }
+      };
+
+      const res = await json(await handleLinksInteraction(
+        await signedRequest(keyPair.privateKey, interactionWithToken({
+          data: linksData('testar', 'https://shop.test/collections/cards')
+        })),
+        x.env, DEFAULTS, validateSource, services
+      ));
+      assert.equal(res.body.type, 5);
+      await Promise.all(background);
+      return res;
+    });
+
+    assert.equal(fetchCalls, 2);
+    assert.equal(testSourceCalls, 1);
+    assert.equal(bodies[0], bodies[1]);
+    const followups = followupRecords(logs);
+    assert.ok(followups.some(r => r.reason === 'patch_ok' && r.attempts === 2));
+    assert.ok(followups.some(r => r.reason === 'work_settled' && r.stage === 'work'));
+    const ids = [...new Set(followups.map(r => r.diagnostic_id))];
+    assert.equal(ids.length, 1);
+    assertNoSensitive(logs, [INTERACTION_TOKEN, publicKey, 'SECRET_TOKEN']);
+  } finally { x.sql.close(); }
+});
+
+test('repeated PATCH network failure stays bounded and safe', async () => {
+  const { keyPair, publicKey } = await makeKeys();
+  const x = setup(publicKey);
+  try {
+    const background = [];
+    let fetchCalls = 0;
+    let testSourceCalls = 0;
+
+    const { logs } = await withCapturedLogs(async () => {
+      const services = {
+        settingsDefaults: SETTINGS_DEFAULTS,
+        waitUntil(promise) { background.push(promise); },
+        async fetcher() {
+          fetchCalls += 1;
+          throw new Error('network SECRET_TOKEN boom');
+        },
+        async testSource() {
+          testSourceCalls += 1;
+          return { url: 'https://shop.test/collections/cards', products: 1, available: 1, unavailable: 0, unknown: 0 };
+        }
+      };
+
+      const res = await json(await handleLinksInteraction(
+        await signedRequest(keyPair.privateKey, interactionWithToken({
+          data: linksData('testar', 'https://shop.test/collections/cards')
+        })),
+        x.env, DEFAULTS, validateSource, services
+      ));
+      assert.equal(res.body.type, 5);
+      await Promise.all(background);
+      return res;
+    });
+
+    assert.equal(testSourceCalls, 1);
+    assert.equal(fetchCalls, 2);
+    assert.ok(fetchCalls <= 3);
+    const followups = followupRecords(logs);
+    assert.ok(followups.some(r => r.reason === 'patch_network_error' && r.outcome === 'failure' && r.attempts === 2));
+    assert.ok(followups.every(r => typeof r.diagnostic_id === 'string' && r.diagnostic_id));
+    const ids = [...new Set(followups.map(r => r.diagnostic_id))];
+    assert.equal(ids.length, 1);
+    assertNoSensitive(logs, [INTERACTION_TOKEN, publicKey, 'SECRET_TOKEN', 'boom']);
   } finally { x.sql.close(); }
 });

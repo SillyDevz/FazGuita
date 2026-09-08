@@ -117,9 +117,11 @@ CLI (recommended — uploads the multi-file Worker, imported JSON, and modules; 
 npx.cmd wrangler deploy
 ```
 
-That updates the **existing** Worker named in `wrangler.jsonc`, keeps the same `workers.dev` route when unchanged, and retains the cron trigger from config. `POST /interactions` must exist on this deploy before Discord can validate the endpoint in step 9. `/ajuda` always replies immediately (private); other fast commands normally return a complete private reply directly (bounded ~1.3s, defer only if slow); `/links testar` and `/monitor testar` still ack then edit the private original.
+That updates the **existing** Worker named in `wrangler.jsonc`, keeps the same `workers.dev` route when unchanged, and retains the cron trigger from config. `POST /interactions` must exist on this deploy before Discord can validate the endpoint in step 9. `/ajuda` always replies immediately (private); other fast commands normally return a complete private reply directly (bounded ~1.3s, defer only if slow); `/links testar` and `/monitor testar` still ack then edit the private original (21s work budget, ≤28s overall completion attempt; PATCH 8s capped by remaining overall; `/links testar` parser still 20s). The timeout edit is best-effort — Discord outage or platform interruption can leave the deferred ack without a final reply.
 
 Dashboard users: **Workers & Pages** → existing Worker → create/upload a **version** that includes the full build (CLI `wrangler deploy` is the supported path). Under **Settings → Bindings**, confirm D1 binding **`DB`**. Under **Variables and Secrets**, confirm webhook, admin, and Discord keys. Do not replace the Worker with a newly created empty one.
+
+This version also replaces unsupported `redirect: 'error'` with `redirect: 'manual'` on store, webhook and interaction PATCH requests. Redirects are still rejected, not followed; Shopify `304 Not Modified` caching remains supported. The old mode can prevent both TEST delivery and completion of the private “thinking…” response in workerd.
 
 ## 9. Interactions Endpoint, then command registration
 
@@ -169,7 +171,7 @@ Confirm:
 - `/health` responds; `enabled` is the **effective** value (D1 override when present)
 - `/status` shows nested `sources` history, `configured` list, dynamic settings, and preserved `pending` when applicable
 - Discord (Manage Guild / Administrator; ephemeral private replies): `/links listar`, `/links testar url:…`, `/links adicionar`, `/links remover`, `/monitor testar`, `/monitor iniciar`, `/monitor estado`, `/ajuda`. Example: `/links adicionar url:https://www.continente.pt/pesquisa/?q=pokemon+tcg&start=0&srule=Continente&pmin=0.01`
-- Suggested sequence: list/test a supported source → `/monitor testar` receives a real labelled **TEST** with tags → `/monitor iniciar` → `/monitor estado` shows per-source baseline / product count / last scan / errors. Follow-up edit budget 8s; `/links testar` source budget 20s. These do not prove checkout stock or phone delivery.
+- Suggested sequence: list/test a supported source → `/monitor testar` receives a real labelled **TEST** with tags → `/monitor iniciar` → `/monitor estado` shows per-source baseline / product count / last scan / errors. Deferred follow-up: 21s work / ≤28s overall completion attempt; PATCH 8s capped by remaining overall; `/links testar` source/parser budget still 20s. Timeout edit is best-effort (Discord outage or platform interruption can leave no final reply). These do not prove checkout stock or phone delivery.
 - Optional admin webhook check — **sends a real TEST message** to Discord (reuse the same secure prompt pattern for `$headers` if the previous `try` block ended):
 
 ```powershell

@@ -166,7 +166,7 @@ export function changesFor(products, known, config) {
 }
 
 async function storeFetch(fetcher, url, headers) {
-  const response = await fetcher(url, { headers, signal: AbortSignal.timeout(10000), redirect: 'error' });
+  const response = await fetcher(url, { headers, signal: AbortSignal.timeout(10000), redirect: 'manual' });
   if (!response.ok) {
     const error = new Error(`Store HTTP ${response.status}`);
     error.retryAfter = response.headers.get('Retry-After');
@@ -225,7 +225,7 @@ async function readSource(source, state, fetcher) {
     const headers = { Accept: source.type === 'continente' ? 'text/html' : 'application/json', 'User-Agent': 'GeekHavenPersonalMonitor/1.0' };
     if (page === 1 && state.etag) headers['If-None-Match'] = state.etag;
     const url = source.type === 'collection' ? `${source.url}/products.json?limit=250&page=${page}` : source.type === 'product' ? `${source.url}.json` : source.url;
-    const response = await fetcher(url, { headers, signal: AbortSignal.timeout(10000), redirect: 'error' });
+    const response = await fetcher(url, { headers, signal: AbortSignal.timeout(10000), redirect: 'manual' });
     if (response.status === 304 && page === 1 && state.initialized) return null;
     if (!response.ok) {
       const error = new Error(`Store HTTP ${response.status}`);
@@ -304,7 +304,7 @@ export async function sendDiscord(env, event, fetcher = fetch, notificationSetti
   };
   if (extras.content !== undefined) payload.content = extras.content;
   const response = await fetcher(webhookURL(env), {
-    method: 'POST', signal: AbortSignal.timeout(10000), redirect: 'error',
+    method: 'POST', signal: AbortSignal.timeout(10000), redirect: 'manual',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });

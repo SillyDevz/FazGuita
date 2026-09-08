@@ -212,7 +212,9 @@ try {
 
 You can also run the registration script with Node 22 directly (`node scripts/register-commands.mjs`). `npm install` is not strictly required for registration alone; deps are still needed for tests and deploy. Do not paste the bot token into a command line that lands in history or source files. After this one-time deploy and registration, Discord commands change D1 sources/settings without further deploys. Rerun registration once after a code upgrade that adds or changes command definitions — not on every config/settings change.
 
-`/ajuda` always replies immediately (private). Other fast commands normally return a complete private reply directly (bounded ~1.3s; fall back to deferred only if slow). `/links testar` and `/monitor testar` still acknowledge then edit the private original. Follow-up edit budget is **8s**; `/links testar` store fetch/parse is capped at **20s**.
+`/ajuda` always replies immediately (private). Other fast commands normally return a complete private reply directly (bounded ~1.3s; fall back to deferred only if slow). `/links testar` and `/monitor testar` still acknowledge then edit the private original. Deferred follow-up work is raced against a **21s** work budget, with an overall **≤28s** completion attempt from schedule entry; the private original PATCH still uses an **8s** allowance capped by remaining overall time. `/links testar` store fetch/parse remains capped at **20s** (unchanged). The timeout edit is best-effort: platform interruption or a Discord outage can still leave the deferred ack without a final reply.
+
+Outbound store, notification and interaction-response requests use `redirect: 'manual'` and reject unsuccessful HTTP responses without following redirects. The workerd runtime rejects `redirect: 'error'` before sending a request; Node-only tests can miss this incompatibility. Conditional Shopify `304 Not Modified` responses still reuse existing history.
 
 ### Command reference
 

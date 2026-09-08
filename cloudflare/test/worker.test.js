@@ -66,6 +66,56 @@ test('throttling and denial preserve history; pause and auth prevent work', asyn
     assert.equal((await worker.fetch(new Request('https://example.test/check', { method: 'POST' }), x.env)).status, 401);
   } finally { x.sql.close(); }
 });
+test('store and notification fetches reject redirects without following them', async () => {
+  const urls = [
+    'https://shop.test/collections/cards',
+    'https://www.continente.pt/pesquisa/?q=pokemon+tcg',
+    'https://www.continente.pt/produto/card-8883406.html'
+  ];
+  for (const status of [301, 302, 303, 307, 308]) {
+    for (const url of urls) {
+      let calls = 0;
+      await assert.rejects(() => testSourceUrl(url, async (_url, options) => {
+        calls++;
+        assert.equal(options.redirect, 'manual');
+        return new Response(null, { status, headers: { Location: 'https://other.test/target' } });
+      }), new RegExp(`Store HTTP ${status}`));
+      assert.equal(calls, 1);
+    }
+    let calls = 0;
+    await assert.rejects(() => sendDiscord({ DISCORD_WEBHOOK_URL: 'https://discord.com/api/webhooks/123/fake' }, {
+      kind: 'TEST', title: 'Test', available: true, url: urls[0]
+    }, async (_url, options) => {
+      calls++;
+      assert.equal(options.redirect, 'manual');
+      return new Response(null, { status, headers: { Location: 'https://other.test/target' } });
+    }), new RegExp(`Discord HTTP ${status}`));
+    assert.equal(calls, 1);
+  }
+});
+
+test('manual redirect mode preserves conditional 304 source history', async () => {
+  const x = setup();
+  try {
+    const url = 'https://shop.test/collections/cards';
+    const cfg = { ...config, sources: [url] };
+    await runCheck(x.env, cfg, async () => Response.json({ products: [product(1, true)] }, { headers: { ETag: 'v1' } }));
+    const known = x.state().sources[url].known;
+    x.due();
+    let calls = 0;
+    const result = await runCheck(x.env, cfg, async (_url, options) => {
+      calls++;
+      assert.equal(options.redirect, 'manual');
+      assert.equal(options.headers['If-None-Match'], 'v1');
+      return new Response(null, { status: 304 });
+    });
+    assert.equal(calls, 1);
+    assert.equal(result.sent, 0);
+    assert.deepEqual(x.state().sources[url].known, known);
+    assert.equal(x.state().sources[url].lastError, null);
+  } finally { x.sql.close(); }
+});
+
 test('event filters and retry delay', () => {
   const products = shopifyProducts([product(1,false), product(2,true)], sourcesFor()[0]);
   assert.equal(changesFor(products, {}, { ...config, alertOnSoldOutListings: false }).length, 1);
@@ -397,7 +447,7 @@ test('runtime filters, interval and notification config apply on configuredCheck
     const posts = [];
     const fakeFetch = async (url, options = {}) => {
       if (String(url).startsWith('https://discord.com')) {
-        assert.equal(options.redirect, 'error');
+        assert.equal(options.redirect, 'manual');
         posts.push(JSON.parse(options.body));
         return Response.json({});
       }
@@ -435,7 +485,7 @@ test('runtime filters, interval and notification config apply on configuredCheck
 test('sendDiscord keeps TEST embed truthful and blocks everyone parsing from product text', async () => {
   const posts = [];
   const fetcher = async (url, options = {}) => {
-    assert.equal(options.redirect, 'error');
+    assert.equal(options.redirect, 'manual');
     posts.push(JSON.parse(options.body));
     return Response.json({});
   };

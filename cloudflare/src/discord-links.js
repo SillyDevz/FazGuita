@@ -322,6 +322,11 @@ function isValidApplicationSnowflake(id) {
 const FOLLOWUP_BUDGET_MS = 8000;
 const FOLLOWUP_RETRY_MAX_MS = 2000;
 const FOLLOWUP_MAX_ATTEMPTS = 3;
+const FOLLOWUP_WORK_BUDGET_MS = 21000;
+const FOLLOWUP_OVERALL_BUDGET_MS = 28000;
+const FOLLOWUP_NETWORK_RETRY_DELAY_MS = 150;
+const FOLLOWUP_WORK_TIMEOUT_CONTENT =
+  'Não foi possível confirmar o resultado dentro do prazo. O pedido pode ainda terminar; evita repeti-lo de imediato.';
 const FAST_REPLY_BUDGET_MS = 1300;
 const ACK_MISS_CODES = new Set([10008, 10015]);
 const ACK_MISS_DELAYS_MS = [150, 300];
@@ -344,7 +349,7 @@ function parseRetryAfterMs(response) {
 function emitFollowup(level, fields) {
   const record = {
     event: FOLLOWUP_EVENT,
-    stage: 'followup',
+    stage: fields.stage === 'work' ? 'work' : 'followup',
     outcome: fields.outcome,
     reason: fields.reason,
     attempts: boundInt(fields.attempts, 10)
@@ -371,13 +376,17 @@ async function parseSafeDiscordErrorCode(response) {
   return null;
 }
 
-async function patchOriginalResponse(fetcher, applicationId, token, content, diagnostic_id) {
+async function patchOriginalResponse(fetcher, applicationId, token, content, diagnostic_id, overallDeadline) {
   const text = content.length > MAX_CONTENT ? content.slice(0, MAX_CONTENT) : content;
   const url = `https://discord.com/api/v10/webhooks/${encodeURIComponent(applicationId)}/${encodeURIComponent(token)}/messages/@original`;
   const body = JSON.stringify({ content: text, allowed_mentions: { parse: [] } });
-  const deadline = Date.now() + FOLLOWUP_BUDGET_MS;
+  const patchAllowance = Date.now() + FOLLOWUP_BUDGET_MS;
+  const deadline = overallDeadline == null
+    ? patchAllowance
+    : Math.min(patchAllowance, overallDeadline);
   let attempts = 0;
   let ackMissRetry = 0;
+  let networkRetryUsed = false;
 
   while (attempts < FOLLOWUP_MAX_ATTEMPTS) {
     const remaining = deadline - Date.now();
@@ -399,9 +408,19 @@ async function patchOriginalResponse(fetcher, applicationId, token, content, dia
         headers: { 'Content-Type': 'application/json' },
         body,
         signal: AbortSignal.timeout(remaining),
-        redirect: 'error'
+        redirect: 'manual'
       });
     } catch {
+      const left = deadline - Date.now();
+      if (
+        !networkRetryUsed
+        && attempts < FOLLOWUP_MAX_ATTEMPTS
+        && FOLLOWUP_NETWORK_RETRY_DELAY_MS <= left - 50
+      ) {
+        networkRetryUsed = true;
+        await sleep(FOLLOWUP_NETWORK_RETRY_DELAY_MS);
+        continue;
+      }
       emitFollowup('warn', {
         diagnostic_id,
         outcome: 'failure',
@@ -599,14 +618,55 @@ function isImmediateDeferCommand(interaction) {
 
 function scheduleFollowup(services, fetcher, applicationId, token, contentPromise, diagnostic_id) {
   services.waitUntil((async () => {
-    let content;
+    const overallDeadline = Date.now() + FOLLOWUP_OVERALL_BUDGET_MS;
+    let workTimer = null;
+    let content = 'Não foi possível processar o pedido.';
+
+    emitFollowup('info', {
+      diagnostic_id,
+      outcome: 'pending',
+      reason: 'work_started',
+      attempts: 0,
+      stage: 'work'
+    });
+
     try {
-      content = await contentPromise;
-    } catch {
-      content = 'Não foi possível processar o pedido.';
+      const raced = await Promise.race([
+        Promise.resolve(contentPromise).then(
+          value => ({ kind: 'settled', value }),
+          () => ({ kind: 'settled', value: 'Não foi possível processar o pedido.' })
+        ),
+        new Promise(resolve => {
+          workTimer = setTimeout(() => resolve({ kind: 'timeout' }), FOLLOWUP_WORK_BUDGET_MS);
+        })
+      ]);
+
+      if (raced.kind === 'timeout') {
+        emitFollowup('warn', {
+          diagnostic_id,
+          outcome: 'failure',
+          reason: 'work_timeout',
+          attempts: 0,
+          stage: 'work'
+        });
+        Promise.resolve(contentPromise).then(() => {}, () => {});
+        content = FOLLOWUP_WORK_TIMEOUT_CONTENT;
+      } else {
+        emitFollowup('info', {
+          diagnostic_id,
+          outcome: 'pending',
+          reason: 'work_settled',
+          attempts: 0,
+          stage: 'work'
+        });
+        content = raced.value;
+      }
+    } finally {
+      if (workTimer !== null) clearTimeout(workTimer);
     }
+
     if (typeof content !== 'string') content = 'Não foi possível processar o pedido.';
-    await patchOriginalResponse(fetcher, applicationId, token, content, diagnostic_id);
+    await patchOriginalResponse(fetcher, applicationId, token, content, diagnostic_id, overallDeadline);
   })());
 }
 
