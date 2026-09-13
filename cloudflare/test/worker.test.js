@@ -229,17 +229,22 @@ test('Continente search URL canonicalization and validation', () => {
   assert.throws(() => sourcesFor(['https://www.continente.pt/pesquisa?q=cards&sz=1.5']));
 });
 
-test('product-detail sold-out override beats JSON-LD and button positives', () => {
-  const contradictory = htmlFor(ldProduct('InStock', '8883689'))
+test('product-detail wrapper is ignored: Continente renders it sold out on every page', () => {
+  // Live pages render data-is-product-out-of-stock="true" plus product-out-of-stock for in-stock products too;
+  // JSON-LD InStock with an enabled PDP button is the real in-stock shape.
+  const liveInStock = htmlFor(ldProduct('InStock', '8883689'))
     + detail('9999999', 'false')
     + detail('8883689', 'true')
     + pdpButton('8883689', 'false');
-  assert.equal(continenteProduct(contradictory, ragingSource)[0].available, false);
+  assert.equal(continenteProduct(liveInStock, ragingSource)[0].available, true);
+  assert.equal(continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('8883689', 'true'), ragingSource)[0].available, true);
+  assert.equal(continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('8883689', null, ' product-out-of-stock') + pdpButton('8883689', 'false'), ragingSource)[0].available, true);
+  assert.equal(continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('8883689', 'maybe'), ragingSource)[0].available, true);
+  // Live sold-out shape: JSON-LD OutOfStock and no PDP add-to-cart button at all.
+  assert.equal(continenteProduct(htmlFor(ldProduct('OutOfStock', '8883689')) + detail('8883689', 'true'), ragingSource)[0].available, false);
   assert.equal(continenteProduct(htmlFor(ldProduct('OutOfStock', '8883689')) + detail('8883689', 'false'), ragingSource)[0].available, false);
-  assert.equal(continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('9999999', 'true') + pdpButton('8883689', 'false'), ragingSource)[0].available, true);
-  assert.equal(continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('8883689', 'false', ' product-out-of-stock') + pdpButton('8883689', 'false'), ragingSource)[0].available, false);
-  assert.equal(continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('8883689', null, ' product-out-of-stock') + pdpButton('8883689', 'false'), ragingSource)[0].available, false);
-  assert.throws(() => continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('8883689', 'maybe'), ragingSource));
+  // The PDP button still overrides an in-stock structured value.
+  assert.equal(continenteProduct(htmlFor(ldProduct('InStock', '8883689')) + detail('8883689', 'false') + pdpButton('8883689', 'true'), ragingSource)[0].available, false);
 });
 
 test('Continente search discovery, empty footer, malformed pages and limits', () => {
