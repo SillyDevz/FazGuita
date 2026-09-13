@@ -88,13 +88,9 @@ export function continenteProduct(html, source) {
   });
   if (!statuses.length || statuses.includes(null) || new Set(statuses).size !== 1) throw new Error('Invalid product feed');
   let available = statuses[0];
-  for (const match of html.matchAll(/<div\b([^>]*)>/gi)) {
-    const attrs = Object.fromEntries([...match[1].matchAll(/([\w-]+)\s*=\s*["']([^"']*)["']/g)].map(m => [m[1].toLowerCase(), m[2]]));
-    const tokens = new Set((attrs.class || '').split(/\s+/).filter(Boolean));
-    if (!tokens.has('product-detail') || attrs['data-pid'] !== sku) continue;
-    if (attrs['data-is-product-out-of-stock'] !== undefined && !['true', 'false'].includes(attrs['data-is-product-out-of-stock'])) throw new Error('Invalid product feed');
-    if (attrs['data-is-product-out-of-stock'] === 'true' || tokens.has('product-out-of-stock')) available = false;
-  }
+  // The product-detail wrapper's data-is-product-out-of-stock attribute and product-out-of-stock class are
+  // server-rendered as sold out on every product page, in stock or not; the page script rewrites them on load
+  // from the add-to-cart button. They carry no stock signal, so only JSON-LD and the PDP button are consulted.
   for (const match of html.matchAll(/<button\b([^>]*)>/gi)) {
     const attrs = Object.fromEntries([...match[1].matchAll(/([\w-]+)\s*=\s*["']([^"']*)["']/g)].map(m => [m[1].toLowerCase(), m[2]]));
     if (attrs['data-container'] !== 'pdp' || attrs['data-pid'] !== sku) continue;

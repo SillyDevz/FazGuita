@@ -35,17 +35,16 @@ $conflict='<script type="application/ld+json">{"@type":"Product","sku":"8883406"
 Reject { Convert-SourceBody $conflict $source }
 $oosSource = Get-Source 'https://www.continente.pt/produto/raging-surf-8883689.html'
 $realPdp = Get-Content -LiteralPath '/tmp/fazguita-continente-product.html' -Raw
-Assert (-not (Convert-SourceBody $realPdp $oosSource).variants[0].available) 'Primary OOS wrapper should win over InStock JSON-LD/button.'
+Assert ((Convert-SourceBody $realPdp $oosSource).variants[0].available) 'Live in-stock PDP (InStock JSON-LD, enabled button, always-true wrapper) must read as available.'
 $otherSku = Get-Source 'https://www.continente.pt/produto/other-9999999.html'
 Reject { Convert-SourceBody $realPdp $otherSku }
-$wrapper = '<div class="row product-detail product-wrapper" data-pid="8883406" data-is-product-out-of-stock="true">'
-Assert (-not (Convert-SourceBody ((Html)+$wrapper) $source).variants[0].available) 'Matching primary OOS wrapper missed.'
-Assert ((Convert-SourceBody ((Html)+$wrapper.Replace('8883406','123')) $source).variants[0].available) 'Other SKU wrapper affected stock.'
-Reject { Convert-SourceBody ((Html)+$wrapper.Replace('true','maybe')) $source }
-$classOnly = '<div class="row product-detail product-wrapper product-out-of-stock" data-pid="8883406">'
-Assert (-not (Convert-SourceBody ((Html)+$classOnly) $source).variants[0].available) 'product-out-of-stock class should force OOS without attr.'
-$classWins = '<div class="row product-detail product-wrapper product-out-of-stock" data-pid="8883406" data-is-product-out-of-stock="false">'
-Assert (-not (Convert-SourceBody ((Html)+$classWins+'<button data-container="pdp" data-pid="8883406" data-outofstock="false">') $source).variants[0].available) 'product-out-of-stock class must win over false attr/button.'
+# Continente renders the product-detail wrapper as sold out on every page (in stock or not) and fixes it client-side,
+# so the wrapper attribute/class must not affect availability.
+$wrapper = '<div class="row product-detail product-wrapper product-out-of-stock" data-pid="8883406" data-is-product-out-of-stock="true">'
+Assert ((Convert-SourceBody ((Html)+$wrapper) $source).variants[0].available) 'Always-true wrapper must not force OOS.'
+Assert ((Convert-SourceBody ((Html)+$wrapper.Replace('true','maybe')) $source).variants[0].available) 'Unknown wrapper attr must be ignored.'
+Assert ((Convert-SourceBody ((Html)+$wrapper+'<button data-container="pdp" data-pid="8883406" data-outofstock="false">') $source).variants[0].available) 'Live in-stock shape must read as available.'
+Assert (-not (Convert-SourceBody ((Html 'https://schema.org/OutOfStock')+$wrapper) $source).variants[0].available) 'OutOfStock JSON-LD must still read as sold out.'
 $realSearch = Get-Content -LiteralPath '/tmp/fazguita-continente-search.html' -Raw
 $footer = Get-ContinenteSearchFooter $realSearch
 Assert ($footer.totalCount -eq 14 -and $footer.pageSize -eq 35 -and $footer.pageNumber -eq 0) 'Live search footer mismatch.'

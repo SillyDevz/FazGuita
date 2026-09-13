@@ -243,18 +243,8 @@ function Convert-SourceBody([string]$Body, $Source) {
         }
         if ($attrText -match '(?i)(?:^|\s)disabled(?:\s|=|$)') { $available = $false }
     }
-    foreach ($div in [regex]::Matches($Body, '(?is)<div\b([^>]*)>')) {
-        $attrs = @{}
-        foreach ($attr in [regex]::Matches($div.Groups[1].Value, '([\w-]+)\s*=\s*["'']([^"'']*)["'']')) { $attrs[$attr.Groups[1].Value] = $attr.Groups[2].Value }
-        $className = [string]$attrs['class']
-        if ($className -notmatch '(?i)(^|\s)product-detail(\s|$)' -or $className -notmatch '(?i)(^|\s)product-wrapper(\s|$)') { continue }
-        if ($attrs['data-pid'] -ne $Source.sku) { continue }
-        if ($attrs.ContainsKey('data-is-product-out-of-stock')) {
-            if ($attrs['data-is-product-out-of-stock'] -ceq 'true') { $available = $false }
-            elseif ($attrs['data-is-product-out-of-stock'] -cne 'false') { throw 'Unknown Continente PDP availability.' }
-        }
-        if ($className -match '(?i)(^|\s)product-out-of-stock(\s|$)') { $available = $false }
-    }
+    # The product-detail wrapper (data-is-product-out-of-stock / product-out-of-stock class) is rendered as sold out
+    # on every product page and corrected by page script on load, so it is deliberately not consulted here.
     if ([string]::IsNullOrWhiteSpace($product.name)) { throw 'Missing Continente product name.' }
     [pscustomobject]@{id=$Source.sku; title=$product.name; handle=$Source.sku; url=$Source.url; variants=@([pscustomobject]@{available=[bool]$available})}
 }
